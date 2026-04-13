@@ -488,12 +488,12 @@ func TestParseTargetsEmpty(t *testing.T) {
 func TestProxyHostBasedRouting(t *testing.T) {
 	// Create two test backends
 	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("backend1"))
+		_, _ = w.Write([]byte("backend1"))
 	}))
 	defer backend1.Close()
 
 	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("backend2"))
+		_, _ = w.Write([]byte("backend2"))
 	}))
 	defer backend2.Close()
 
@@ -571,18 +571,18 @@ func TestProxyWebSocketRouting(t *testing.T) {
 	// Create two backends that detect WebSocket upgrades
 	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Upgrade") == "websocket" {
-			w.Write([]byte("ws-backend1"))
+			_, _ = w.Write([]byte("ws-backend1"))
 		} else {
-			w.Write([]byte("http-backend1"))
+			_, _ = w.Write([]byte("http-backend1"))
 		}
 	}))
 	defer backend1.Close()
 
 	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Upgrade") == "websocket" {
-			w.Write([]byte("ws-backend2"))
+			_, _ = w.Write([]byte("ws-backend2"))
 		} else {
-			w.Write([]byte("http-backend2"))
+			_, _ = w.Write([]byte("http-backend2"))
 		}
 	}))
 	defer backend2.Close()
