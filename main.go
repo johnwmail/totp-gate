@@ -7,6 +7,7 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
+	"crypto/tls"
 	"encoding/base32"
 	"encoding/binary"
 	"encoding/hex"
@@ -42,19 +43,20 @@ var (
 // ---------------------------------------------------------------------------
 
 type config struct {
-	listenAddr      string
-	upstreamURL     *url.URL            // fallback (single-target mode)
-	targets         map[string]*url.URL // host → upstream (multi-target mode)
-	totpSecret      []byte              // raw bytes (decoded from base32)
-	totpPeriod      int64
-	totpDigits      int
-	totpAlgo        string // "SHA1", "SHA256", "SHA512"
-	cookieTTL       int    // max session lifetime (seconds)
-	cookieSecure    bool   // secure flag on cookies
-	refreshInterval int    // activity refresh interval (seconds)
-	authDisabled    bool
-	cookieKey       []byte // derived from totpSecret
-	trustedProxies  []*net.IPNet
+	listenAddr         string
+	upstreamURL        *url.URL            // fallback (single-target mode)
+	targets            map[string]*url.URL // host → upstream (multi-target mode)
+	totpSecret         []byte              // raw bytes (decoded from base32)
+	totpPeriod         int64
+	totpDigits         int
+	totpAlgo           string // "SHA1", "SHA256", "SHA512"
+	cookieTTL          int    // max session lifetime (seconds)
+	cookieSecure       bool   // secure flag on cookies
+	refreshInterval    int    // activity refresh interval (seconds)
+	authDisabled       bool
+	cookieKey          []byte // derived from totpSecret
+	trustedProxies     []*net.IPNet
+	insecureSkipVerify bool // skip upstream TLS cert verification
 }
 
 func loadConfig() *config {
@@ -92,6 +94,8 @@ func loadConfig() *config {
 	}
 
 	c.authDisabled = strings.EqualFold(os.Getenv("TOTPGATE_AUTH_DISABLED"), "true")
+
+	c.insecureSkipVerify = strings.EqualFold(os.Getenv("TOTPGATE_INSECURE_SKIP_VERIFY"), "true")
 
 	// Allow configuring cookie Secure flag (default true for HTTPS deployments)
 	cookieSecureEnv := os.Getenv("TOTPGATE_AUTH_COOKIE_SECURE")
@@ -648,7 +652,8 @@ func main() {
 	for i, cidr := range cfg.trustedProxies {
 		trustedStrs[i] = cidr.String()
 	}
-	log.Printf("  trusted_proxies:  %s", strings.Join(trustedStrs, ", "))
+	log.Printf("  trusted_proxies:   %s", strings.Join(trustedStrs, ", "))
+	log.Printf("  insecure_skip_verify: %v", cfg.insecureSkipVerify)
 
 	// Rate limiter: 5 attempts per IP per minute
 	rl := newRateLimiter(5, 1*time.Minute)
@@ -667,7 +672,6 @@ func main() {
 				if host == "" {
 					host = r.In.Header.Get("Host")
 				}
-				// Strip port from Host for matching (e.g., "example.com:8080" → "example.com").
 				if h, _, err := net.SplitHostPort(host); err == nil {
 					host = h
 				}
@@ -675,6 +679,15 @@ func main() {
 					r.SetURL(target)
 				}
 			}
+
+			// Preserve original Host header for upstream
+			r.Out.Host = r.In.Host
+			r.Out.Header.Set("Host", r.In.Host)
+		},
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: cfg.insecureSkipVerify, // nolint:gosec
+			},
 		},
 	}
 

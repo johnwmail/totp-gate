@@ -59,6 +59,7 @@ All configuration is done via environment variables:
 | `TOTPGATE_AUTH_COOKIE_SECURE` | `true` | Set `Secure` flag on cookies (set `false` for local dev/test with HTTP-only) |
 | `TOTPGATE_AUTH_REFRESH_INTERVAL` | `600` | Activity refresh interval in seconds (10m) |
 | `TOTPGATE_TRUSTED_PROXIES` | *(see below)* | Comma-separated trusted proxy IPs or CIDRs for forwarded-header trust |
+| `TOTPGATE_INSECURE_SKIP_VERIFY` | `false` | Skip TLS certificate verification for `https://` upstream targets (dev/testing only) |
 
 ### Secret Priority
 
@@ -79,6 +80,16 @@ The `X-Real-IP` and `X-Forwarded-For` headers are only trusted when the immediat
   - Local nginx: use defaults (nginx on `127.0.0.1` is already trusted)
 
 If the request comes from an untrusted peer (e.g., direct internet connection), these headers are ignored and `r.RemoteAddr` is used.
+
+### Upstream TLS Verification
+
+When routing to `https://` upstream targets, totp-gate validates TLS certificates against the system CA store by default. For internal services with self-signed or private CA certificates, set:
+
+```bash
+TOTPGATE_INSECURE_SKIP_VERIFY=true
+```
+
+⚠️ **Warning**: Only use this in development or trusted networks. In production, mount your CA certificate into the container and ensure the system trust store includes it.
 
 ### Multi-Target Routing
 

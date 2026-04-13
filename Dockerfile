@@ -1,4 +1,5 @@
 FROM golang:1.26-alpine AS builder
+RUN apk add --no-cache ca-certificates
 WORKDIR /app
 
 ARG VERSION=dev
@@ -13,6 +14,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
   -o totp-gate .
 
 FROM gcr.io/distroless/static
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /app/totp-gate /totp-gate
 USER 8080
 EXPOSE 8080

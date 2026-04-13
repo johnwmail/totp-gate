@@ -44,3 +44,72 @@ jobs:
         with:
           file: coverage.out
           fail_ci_if_error: false
+
+  integration-test:
+    name: Integration Test (TLS)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build container
+        run: docker build -t totp-gate:test .
+
+      - name: Verify CA certificates are present
+        run: |
+          docker run --rm totp-gate:test test -f /etc/ssl/certs/ca-certificates.crt
+          echo "CA bundle found in container"
+
+      - name: Test proxy to real HTTPS upstream (google.com)
+        run: |
+          docker run -d --name test-google \
+            -e TOTPGATE_UPSTREAM=https://www.google.com \
+            -e TOTPGATE_TOTP_SECRET=JBSWY3DPEHPK3PXP \
+            -e TOTPGATE_AUTH_DISABLED=true \
+            --network host \
+            totp-gate:test
+          sleep 3
+
+          # Verify TLS validation works against real public certs
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            --resolve www.google.com:8080:127.0.0.1 \
+            http://www.google.com:8080/)
+          echo "google.com response: $CODE"
+          if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 400 ]; then
+            echo "Single-target HTTPS proxy: PASSED"
+          else
+            docker logs test-google
+            exit 1
+          fi
+          docker rm -f test-google
+
+      - name: Test multi-target routing with real HTTPS backends
+        run: |
+          docker run -d --name test-multi \
+            -e TOTPGATE_TARGETS="google.com=https://www.google.com,github.com=https://github.com" \
+            -e TOTPGATE_TOTP_SECRET=JBSWY3DPEHPK3PXP \
+            -e TOTPGATE_AUTH_DISABLED=true \
+            --network host \
+            totp-gate:test
+          sleep 3
+
+          # Route 1: google.com:8080 -> localhost:8080 -> https://www.google.com
+          CODE1=$(curl -s -o /dev/null -w "%{http_code}" \
+            --resolve google.com:8080:127.0.0.1 \
+            http://google.com:8080/)
+          echo "google.com response: $CODE1"
+
+          # Route 2: github.com:8080 -> localhost:8080 -> https://github.com
+          CODE2=$(curl -s -o /dev/null -w "%{http_code}" \
+            --resolve github.com:8080:127.0.0.1 \
+            http://github.com:8080/)
+          echo "github.com response: $CODE2"
+
+          if [ "$CODE1" -ge 200 ] && [ "$CODE1" -lt 400 ] && \
+             [ "$CODE2" -ge 200 ] && [ "$CODE2" -lt 400 ]; then
+            echo "Multi-target HTTPS routing: PASSED"
+          else
+            docker logs test-multi
+            exit 1
+          fi
+          docker rm -f test-multi
