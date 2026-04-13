@@ -81,18 +81,18 @@ jobs:
       - name: Test multi-target routing with real HTTPS backends
         run: |
           docker run -d --name test-multi \
-            -e TOTPGATE_TARGETS="google.com=https://www.google.com,github.com=https://github.com" \
+            -e TOTPGATE_TARGETS="www.google.com=https://www.google.com,github.com=https://github.com" \
             -e TOTPGATE_TOTP_SECRET=JBSWY3DPEHPK3PXP \
             -e TOTPGATE_AUTH_DISABLED=true \
             --network host \
             totp-gate:test
           sleep 3
 
-          # Route 1: google.com:8080 -> localhost:8080 -> https://www.google.com
+          # Route 1: www.google.com:8080 -> localhost:8080 -> https://www.google.com
           CODE1=$(curl -s -o /dev/null -w "%{http_code}" \
-            --resolve google.com:8080:127.0.0.1 \
-            http://google.com:8080/)
-          echo "google.com response: $CODE1"
+            --resolve www.google.com:8080:127.0.0.1 \
+            http://www.google.com:8080/)
+          echo "www.google.com response: $CODE1"
 
           # Route 2: github.com:8080 -> localhost:8080 -> https://github.com
           CODE2=$(curl -s -o /dev/null -w "%{http_code}" \
