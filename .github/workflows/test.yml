@@ -55,11 +55,6 @@ jobs:
       - name: Build container
         run: docker build -t totp-gate:test .
 
-      - name: Verify CA certificates are present
-        run: |
-          docker run --rm --entrypoint test totp-gate:test -f /etc/ssl/certs/ca-certificates.crt
-          echo "CA bundle found in container"
-
       - name: Test proxy to real HTTPS upstream (google.com) with Auth
         run: |
           docker run -d --name test-google \
@@ -83,27 +78,30 @@ jobs:
           echo "Generated TOTP Code: $CODE"
 
           # Login and save cookie
-          LOGIN_CODE=$(curl -s -o /dev/null -w "%{http_code}" -c /tmp/cookie.txt \
+          LOGIN_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -c /tmp/cookie.txt \
             -X POST -d "code=$CODE" http://localhost:8080/totp-gate/login)
-          echo "Login Response: $LOGIN_CODE"
+          echo "Login Status: $LOGIN_STATUS"
 
-          if [ "$LOGIN_CODE" != "303" ]; then
+          if [ "$LOGIN_STATUS" != "303" ]; then
+            echo "Login failed"
             docker logs test-google
+            docker rm -f test-google
             exit 1
           fi
 
-          # Access upstream with cookie
-          CODE=$(curl -s -o /dev/null -w "%{http_code}" -b /tmp/cookie.txt \
+          # Access upstream with cookie (follow redirects)
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" -b /tmp/cookie.txt -L \
             --resolve www.google.com:8080:127.0.0.1 \
             http://www.google.com:8080/)
           echo "google.com response: $CODE"
 
-          if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 400 ]; then
-            echo "Single-target HTTPS proxy with Auth: PASSED"
-          else
+          if [ "$CODE" -ne 200 ]; then
+            echo "Proxy failed"
             docker logs test-google
+            docker rm -f test-google
             exit 1
           fi
+          echo "Single-target HTTPS proxy with Auth: PASSED"
           docker rm -f test-google
 
       - name: Test multi-target routing with real HTTPS backends and Auth
@@ -129,32 +127,34 @@ jobs:
           echo "Generated TOTP Code: $CODE"
 
           # Login and save cookie
-          LOGIN_CODE=$(curl -s -o /dev/null -w "%{http_code}" -c /tmp/cookie.txt \
+          LOGIN_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -c /tmp/cookie.txt \
             -X POST -d "code=$CODE" http://localhost:8080/totp-gate/login)
-          echo "Login Response: $LOGIN_CODE"
+          echo "Login Status: $LOGIN_STATUS"
 
-          if [ "$LOGIN_CODE" != "303" ]; then
+          if [ "$LOGIN_STATUS" != "303" ]; then
+            echo "Login failed"
             docker logs test-multi
+            docker rm -f test-multi
             exit 1
           fi
 
           # Route 1: www.google.com:8080 -> localhost:8080 -> https://www.google.com
-          CODE1=$(curl -s -o /dev/null -w "%{http_code}" -b /tmp/cookie.txt \
+          CODE1=$(curl -s -o /dev/null -w "%{http_code}" -b /tmp/cookie.txt -L \
             --resolve www.google.com:8080:127.0.0.1 \
             http://www.google.com:8080/)
           echo "www.google.com response: $CODE1"
 
           # Route 2: github.com:8080 -> localhost:8080 -> https://github.com
-          CODE2=$(curl -s -o /dev/null -w "%{http_code}" -b /tmp/cookie.txt \
+          CODE2=$(curl -s -o /dev/null -w "%{http_code}" -b /tmp/cookie.txt -L \
             --resolve github.com:8080:127.0.0.1 \
             http://github.com:8080/)
           echo "github.com response: $CODE2"
 
-          if [ "$CODE1" -ge 200 ] && [ "$CODE1" -lt 400 ] && \
-             [ "$CODE2" -ge 200 ] && [ "$CODE2" -lt 400 ]; then
-            echo "Multi-target HTTPS routing with Auth: PASSED"
-          else
+          if [ "$CODE1" -ne 200 ] || [ "$CODE2" -ne 200 ]; then
+            echo "Proxy failed"
             docker logs test-multi
+            docker rm -f test-multi
             exit 1
           fi
+          echo "Multi-target HTTPS routing with Auth: PASSED"
           docker rm -f test-multi
