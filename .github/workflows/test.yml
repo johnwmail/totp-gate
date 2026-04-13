@@ -57,7 +57,7 @@ jobs:
 
       - name: Verify CA certificates are present
         run: |
-          docker run --rm totp-gate:test test -f /etc/ssl/certs/ca-certificates.crt
+          docker run --rm --entrypoint test totp-gate:test -f /etc/ssl/certs/ca-certificates.crt
           echo "CA bundle found in container"
 
       - name: Test proxy to real HTTPS upstream (google.com)
