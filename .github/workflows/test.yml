@@ -55,11 +55,6 @@ jobs:
       - name: Build container
         run: docker build -t totp-gate:test .
 
-      - name: Verify CA certificates are present
-        run: |
-          docker run --rm --entrypoint test totp-gate:test -f /etc/ssl/certs/ca-certificates.crt
-          echo "CA bundle found in container"
-
       - name: Test proxy to real HTTPS upstream (google.com)
         run: |
           docker run -d --name test-google \

@@ -13,6 +13,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
   -ldflags="-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.BuildTime=${BUILDTIME}" \
   -o totp-gate .
 
+RUN test -f /etc/ssl/certs/ca-certificates.crt
+
 FROM gcr.io/distroless/static
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /app/totp-gate /totp-gate
