@@ -43,8 +43,9 @@ var (
 
 type config struct {
 	listenAddr      string
-	upstreamURL     *url.URL
-	totpSecret      []byte // raw bytes (decoded from base32)
+	upstreamURL     *url.URL            // fallback (single-target mode)
+	targets         map[string]*url.URL // host → upstream (multi-target mode)
+	totpSecret      []byte              // raw bytes (decoded from base32)
 	totpPeriod      int64
 	totpDigits      int
 	totpAlgo        string // "SHA1", "SHA256", "SHA512"
@@ -61,12 +62,34 @@ func loadConfig() *config {
 
 	c.listenAddr = envOrDefault("TOTPGATE_AUTH_LISTEN", ":8080")
 
-	upstream := envOrDefault("TOTPGATE_UPSTREAM", "http://localhost:3000")
-	u, err := url.Parse(upstream)
-	if err != nil {
-		log.Fatalf("invalid TOTPGATE_UPSTREAM %q: %v", upstream, err)
+	// Parse multi-target routing if set, otherwise fall back to single upstream.
+	// Format: "host1=http://backend1:port,host2=http://backend2:port"
+	targetsEnv := os.Getenv("TOTPGATE_TARGETS")
+	if targetsEnv != "" {
+		c.targets = parseTargets(targetsEnv)
+		if len(c.targets) == 0 {
+			log.Fatalf("TOTPGATE_TARGETS is set but no valid targets were parsed")
+		}
+		// Single-target: use the sole entry as upstream (no fallback needed).
+		if len(c.targets) == 1 {
+			for _, u := range c.targets {
+				c.upstreamURL = u
+			}
+		} else {
+			// Multi-target: first entry acts as default fallback if Host doesn't match.
+			for _, u := range c.targets {
+				c.upstreamURL = u
+				break
+			}
+		}
+	} else {
+		upstream := envOrDefault("TOTPGATE_UPSTREAM", "http://localhost:3000")
+		u, err := url.Parse(upstream)
+		if err != nil {
+			log.Fatalf("invalid TOTPGATE_UPSTREAM %q: %v", upstream, err)
+		}
+		c.upstreamURL = u
 	}
-	c.upstreamURL = u
 
 	c.authDisabled = strings.EqualFold(os.Getenv("TOTPGATE_AUTH_DISABLED"), "true")
 
@@ -223,6 +246,31 @@ func isTrustedProxy(ipStr string, trusted []*net.IPNet) bool {
 		}
 	}
 	return false
+}
+
+// parseTargets parses the TOTPGATE_TARGETS env var into a host→upstream map.
+// Format: "host1=http://backend1:port,host2=http://backend2:port"
+func parseTargets(env string) map[string]*url.URL {
+	targets := make(map[string]*url.URL)
+	for _, entry := range strings.Split(env, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		parts := strings.SplitN(entry, "=", 2)
+		if len(parts) != 2 {
+			log.Printf("warning: skipping invalid target %q (expected host=upstream)", entry)
+			continue
+		}
+		host := strings.TrimSpace(parts[0])
+		upstreamURL, err := url.Parse(strings.TrimSpace(parts[1]))
+		if err != nil {
+			log.Printf("warning: skipping target %q: invalid upstream URL: %v", host, err)
+			continue
+		}
+		targets[host] = upstreamURL
+	}
+	return targets
 }
 
 // ---------------------------------------------------------------------------
@@ -573,7 +621,20 @@ func main() {
 
 	log.Printf("totpgate-auth starting version=%s commit=%s built=%s", Version, Commit, BuildTime)
 	log.Printf("  listen:          %s", cfg.listenAddr)
-	log.Printf("  upstream:        %s", cfg.upstreamURL.String())
+
+	if len(cfg.targets) > 0 {
+		// Multi-target mode: show full route table.
+		targetKeys := make([]string, 0, len(cfg.targets))
+		for host := range cfg.targets {
+			targetKeys = append(targetKeys, host)
+		}
+		log.Printf("  targets (%d):", len(cfg.targets))
+		for _, host := range targetKeys {
+			log.Printf("    %-30s → %s", host, cfg.targets[host].String())
+		}
+	} else {
+		log.Printf("  upstream:        %s", cfg.upstreamURL.String())
+	}
 	log.Printf("  period:          %d", cfg.totpPeriod)
 	log.Printf("  digits:          %d", cfg.totpDigits)
 	log.Printf("  algorithm:       %s", cfg.totpAlgo)
@@ -592,10 +653,29 @@ func main() {
 	// Rate limiter: 5 attempts per IP per minute
 	rl := newRateLimiter(5, 1*time.Minute)
 
-	// Reverse proxy for normal HTTP
-	proxy := httputil.NewSingleHostReverseProxy(cfg.upstreamURL)
-	proxy.Rewrite = func(r *httputil.ProxyRequest) {
-		r.Out.Header.Set("X-Real-IP", clientIP(r.In, cfg.trustedProxies))
+	// Reverse proxy with dynamic host-based routing
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.Out.Header.Set("X-Real-IP", clientIP(r.In, cfg.trustedProxies))
+
+			// Default to fallback upstream
+			r.SetURL(cfg.upstreamURL)
+
+			// If multi-target mode is active, route based on Host header.
+			if len(cfg.targets) > 0 {
+				host := r.In.Host
+				if host == "" {
+					host = r.In.Header.Get("Host")
+				}
+				// Strip port from Host for matching (e.g., "example.com:8080" → "example.com").
+				if h, _, err := net.SplitHostPort(host); err == nil {
+					host = h
+				}
+				if target, ok := cfg.targets[host]; ok {
+					r.SetURL(target)
+				}
+			}
+		},
 	}
 
 	mux := http.NewServeMux()
