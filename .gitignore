@@ -1,0 +1,24 @@
+# Binaries
+totp-gate
+
+# Build output
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Secrets (never commit these)
+*.pem
+*.key
+*.secret
