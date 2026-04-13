@@ -48,6 +48,7 @@ All configuration is done via environment variables:
 |----------|---------|-------------|
 | `TOTPGATE_AUTH_LISTEN` | `:8080` | Address to listen on |
 | `TOTPGATE_UPSTREAM` | `http://localhost:3000` | Upstream service URL to proxy to |
+| `TOTPGATE_TARGETS` | *(empty)* | Multi-target routing: `host1=upstream1,host2=upstream2`. Overrides `TOTPGATE_UPSTREAM`. |
 | `TOTPGATE_AUTH_DISABLED` | `false` | Disable authentication (bypass mode) |
 | `TOTPGATE_TOTP_SECRET` | *(required)* | Base32-encoded TOTP secret (fallback) |
 | `TOTPGATE_TOTP_SECRET_FILE` | `/run/secrets/totpgate_totp_secret` | Path to file containing TOTP secret |
@@ -79,11 +80,53 @@ The `X-Real-IP` and `X-Forwarded-For` headers are only trusted when the immediat
 
 If the request comes from an untrusted peer (e.g., direct internet connection), these headers are ignored and `r.RemoteAddr` is used.
 
+### Multi-Target Routing
+
+When `TOTPGATE_TARGETS` is set, the gateway routes requests to different upstream services based on the `Host` header:
+
+```bash
+TOTPGATE_TARGETS="app1.example.com=http://localhost:3000,app2.example.com=http://localhost:4000" ./totp-gate
+```
+
+**Behavior:**
+
+- The port is stripped from the `Host` before matching (e.g., `app1.example.com:8080` → `app1.example.com`).
+- If no host matches, the **first target** in the list acts as the default fallback — this also covers HTTP/1.0 requests with no `Host` header.
+- WebSocket upgrades are fully supported and routed to the correct backend.
+- `TOTPGATE_UPSTREAM` is ignored when `TOTPGATE_TARGETS` is set.
+
+**Docker Compose example:**
+
+```yaml
+services:
+  totp-gate:
+    image: johnwmail/totp-gate:latest
+    ports:
+      - "8080:8080"
+    environment:
+      TOTPGATE_TARGETS: "app1.example.com=http://app1:3000,app2.example.com=http://app2:4000"
+    secrets:
+      - totpgate_totp_secret
+secrets:
+  totpgate_totp_secret:
+    file: ./secret.txt
+```
+
 ## Architecture
+
+### Single Target (default)
 
 ```
 Client → totp-gate (:8080) → Upstream Service (:3000)
               ↑
+         TOTP Gate
+```
+
+### Multi-Target (via TOTPGATE_TARGETS)
+
+```
+Client → totp-gate (:8080) ──Host: app1.example.com──→ Service A (:3000)
+              ↑               └──Host: app2.example.com──→ Service B (:4000)
          TOTP Gate
 ```
 
@@ -137,6 +180,17 @@ docker service create \
   -p 8080:8080 \
   -e TOTPGATE_UPSTREAM=http://myapp:3000 \
   totp-gate
+```
+
+Or with multi-target routing:
+
+```bash
+docker run -d \
+  --name totp-gate \
+  -p 8080:8080 \
+  -e TOTPGATE_TARGETS="app1.example.com=http://app1:3000,app2.example.com=http://app2:4000" \
+  -e TOTPGATE_TOTP_SECRET="JBSWY3DPEHPK3PXP" \
+  johnwmail/totp-gate:latest
 ```
 
 ## License

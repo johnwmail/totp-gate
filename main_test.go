@@ -10,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"testing"
 	"time"
 )
@@ -444,5 +446,234 @@ func TestParseTrustedProxiesBareIP(t *testing.T) {
 	cidrs := parseTrustedProxies("1.2.3.4")
 	if !isTrustedProxy("1.2.3.4", cidrs) {
 		t.Error("bare IP should be accepted as /32")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Host-Based Routing Tests
+// ---------------------------------------------------------------------------
+
+func TestParseTargets(t *testing.T) {
+	targets := parseTargets("app1.example.com=http://localhost:3000,app2.example.com=http://localhost:4000")
+
+	if len(targets) != 2 {
+		t.Fatalf("expected 2 targets, got %d", len(targets))
+	}
+
+	if targets["app1.example.com"].String() != "http://localhost:3000" {
+		t.Errorf("unexpected URL for app1: %s", targets["app1.example.com"].String())
+	}
+	if targets["app2.example.com"].String() != "http://localhost:4000" {
+		t.Errorf("unexpected URL for app2: %s", targets["app2.example.com"].String())
+	}
+}
+
+func TestParseTargetsInvalid(t *testing.T) {
+	targets := parseTargets("invalid-no-equals,app1.example.com=http://localhost:3000")
+	if len(targets) != 1 {
+		t.Fatalf("expected 1 valid target, got %d", len(targets))
+	}
+	if _, ok := targets["app1.example.com"]; !ok {
+		t.Error("valid target should be present")
+	}
+}
+
+func TestParseTargetsEmpty(t *testing.T) {
+	targets := parseTargets("")
+	if len(targets) != 0 {
+		t.Fatalf("expected 0 targets, got %d", len(targets))
+	}
+}
+
+func TestProxyHostBasedRouting(t *testing.T) {
+	// Create two test backends
+	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("backend1"))
+	}))
+	defer backend1.Close()
+
+	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("backend2"))
+	}))
+	defer backend2.Close()
+
+	u1, _ := url.Parse(backend1.URL)
+	u2, _ := url.Parse(backend2.URL)
+
+	targets := map[string]*url.URL{
+		"app1.example.com": u1,
+		"app2.example.com": u2,
+	}
+
+	// Create proxy with dynamic routing using Rewrite only.
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			// Default to first target (fallback).
+			r.SetURL(u1)
+			if len(targets) > 0 {
+				host := r.In.Host
+				if host == "" {
+					host = r.In.Header.Get("Host")
+				}
+				if h, _, err := net.SplitHostPort(host); err == nil {
+					host = h
+				}
+				if target, ok := targets[host]; ok {
+					r.SetURL(target)
+				}
+			}
+			r.Out.Header.Set("Host", r.In.Host)
+		},
+	}
+
+	tests := []struct {
+		name     string
+		host     string
+		expected string
+	}{
+		{
+			name:     "routes to backend1",
+			host:     "app1.example.com",
+			expected: "backend1",
+		},
+		{
+			name:     "routes to backend2",
+			host:     "app2.example.com",
+			expected: "backend2",
+		},
+		{
+			name:     "routes to backend1 with port stripped",
+			host:     "app1.example.com:8080",
+			expected: "backend1",
+		},
+		{
+			name:     "unknown host falls back to first target",
+			host:     "unknown.example.com",
+			expected: "backend1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/", nil)
+			req.Host = tt.host
+			rr := httptest.NewRecorder()
+			proxy.ServeHTTP(rr, req)
+
+			if rr.Body.String() != tt.expected {
+				t.Errorf("expected body %q, got %q", tt.expected, rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestProxyWebSocketRouting(t *testing.T) {
+	// Create two backends that detect WebSocket upgrades
+	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Upgrade") == "websocket" {
+			w.Write([]byte("ws-backend1"))
+		} else {
+			w.Write([]byte("http-backend1"))
+		}
+	}))
+	defer backend1.Close()
+
+	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Upgrade") == "websocket" {
+			w.Write([]byte("ws-backend2"))
+		} else {
+			w.Write([]byte("http-backend2"))
+		}
+	}))
+	defer backend2.Close()
+
+	u1, _ := url.Parse(backend1.URL)
+	u2, _ := url.Parse(backend2.URL)
+
+	targets := map[string]*url.URL{
+		"app1.example.com": u1,
+		"app2.example.com": u2,
+	}
+
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.SetURL(u1)
+			if len(targets) > 0 {
+				host := r.In.Host
+				if host == "" {
+					host = r.In.Header.Get("Host")
+				}
+				if h, _, err := net.SplitHostPort(host); err == nil {
+					host = h
+				}
+				if target, ok := targets[host]; ok {
+					r.SetURL(target)
+				}
+			}
+			r.Out.Header.Set("Host", r.In.Host)
+		},
+	}
+
+	tests := []struct {
+		name     string
+		host     string
+		upgrade  string
+		expected string
+	}{
+		{
+			name:     "HTTP request routes to backend1",
+			host:     "app1.example.com",
+			upgrade:  "",
+			expected: "http-backend1",
+		},
+		{
+			name:     "HTTP request routes to backend2",
+			host:     "app2.example.com",
+			upgrade:  "",
+			expected: "http-backend2",
+		},
+		{
+			name:     "WebSocket upgrade routes to backend1",
+			host:     "app1.example.com",
+			upgrade:  "websocket",
+			expected: "ws-backend1",
+		},
+		{
+			name:     "WebSocket upgrade routes to backend2",
+			host:     "app2.example.com",
+			upgrade:  "websocket",
+			expected: "ws-backend2",
+		},
+		{
+			name:     "WebSocket with port in Host",
+			host:     "app1.example.com:8080",
+			upgrade:  "websocket",
+			expected: "ws-backend1",
+		},
+		{
+			name:     "Unknown host falls back to first target (WebSocket)",
+			host:     "unknown.example.com",
+			upgrade:  "websocket",
+			expected: "ws-backend1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/", nil)
+			req.Host = tt.host
+			if tt.upgrade != "" {
+				req.Header.Set("Upgrade", "websocket")
+				req.Header.Set("Connection", "Upgrade")
+				req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+				req.Header.Set("Sec-WebSocket-Version", "13")
+			}
+			rr := httptest.NewRecorder()
+			proxy.ServeHTTP(rr, req)
+
+			if rr.Body.String() != tt.expected {
+				t.Errorf("expected body %q, got %q", tt.expected, rr.Body.String())
+			}
+		})
 	}
 }
