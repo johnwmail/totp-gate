@@ -56,7 +56,7 @@ jobs:
             echo "version=sha-${SHORT_SHA}" >> $GITHUB_OUTPUT
           fi
           echo "commit=${{ github.sha }}" >> $GITHUB_OUTPUT
-          echo "build_time=${{ github.event.head_commit.timestamp || github.event.repository.updated_at }}" >> $GITHUB_OUTPUT
+          echo "build_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> $GITHUB_OUTPUT
 
       - name: Build and push
         uses: docker/build-push-action@v6
