@@ -46,7 +46,7 @@ jobs:
           fail_ci_if_error: false
 
   integration-test:
-    name: Integration Test (TLS)
+    name: Integration Test (TLS & Auth)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -55,54 +55,104 @@ jobs:
       - name: Build container
         run: docker build -t totp-gate:test .
 
-      - name: Test proxy to real HTTPS upstream (google.com)
+      - name: Verify CA certificates are present
+        run: |
+          docker run --rm --entrypoint test totp-gate:test -f /etc/ssl/certs/ca-certificates.crt
+          echo "CA bundle found in container"
+
+      - name: Test proxy to real HTTPS upstream (google.com) with Auth
         run: |
           docker run -d --name test-google \
             -e TOTPGATE_UPSTREAM=https://www.google.com \
             -e TOTPGATE_TOTP_SECRET=JBSWY3DPEHPK3PXP \
-            -e TOTPGATE_AUTH_DISABLED=true \
             --network host \
             totp-gate:test
           sleep 3
 
-          # Verify TLS validation works against real public certs
-          CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+          # Generate valid TOTP code
+          CODE=$(python3 -c "
+          import hmac, hashlib, struct, time, base64
+          def hotp(key, counter, digits=6):
+              key = base64.b32decode(key.upper())
+              msg = struct.pack('>Q', counter)
+              h = hmac.new(key, msg, hashlib.sha1).digest()
+              o = h[19] & 15
+              return str((struct.unpack('>I', h[o:o+4])[0] & 0x7fffffff) % 10**digits).zfill(digits)
+          print(hotp('JBSWY3DPEHPK3PXP', int(time.time()) // 30))
+          ")
+          echo "Generated TOTP Code: $CODE"
+
+          # Login and save cookie
+          LOGIN_CODE=$(curl -s -o /dev/null -w "%{http_code}" -c /tmp/cookie.txt \
+            -X POST -d "code=$CODE" http://localhost:8080/totp-gate/login)
+          echo "Login Response: $LOGIN_CODE"
+
+          if [ "$LOGIN_CODE" != "303" ]; then
+            docker logs test-google
+            exit 1
+          fi
+
+          # Access upstream with cookie
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" -b /tmp/cookie.txt \
             --resolve www.google.com:8080:127.0.0.1 \
             http://www.google.com:8080/)
           echo "google.com response: $CODE"
+
           if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 400 ]; then
-            echo "Single-target HTTPS proxy: PASSED"
+            echo "Single-target HTTPS proxy with Auth: PASSED"
           else
             docker logs test-google
             exit 1
           fi
           docker rm -f test-google
 
-      - name: Test multi-target routing with real HTTPS backends
+      - name: Test multi-target routing with real HTTPS backends and Auth
         run: |
           docker run -d --name test-multi \
             -e TOTPGATE_TARGETS="www.google.com=https://www.google.com,github.com=https://github.com" \
             -e TOTPGATE_TOTP_SECRET=JBSWY3DPEHPK3PXP \
-            -e TOTPGATE_AUTH_DISABLED=true \
             --network host \
             totp-gate:test
           sleep 3
 
+          # Generate valid TOTP code
+          CODE=$(python3 -c "
+          import hmac, hashlib, struct, time, base64
+          def hotp(key, counter, digits=6):
+              key = base64.b32decode(key.upper())
+              msg = struct.pack('>Q', counter)
+              h = hmac.new(key, msg, hashlib.sha1).digest()
+              o = h[19] & 15
+              return str((struct.unpack('>I', h[o:o+4])[0] & 0x7fffffff) % 10**digits).zfill(digits)
+          print(hotp('JBSWY3DPEHPK3PXP', int(time.time()) // 30))
+          ")
+          echo "Generated TOTP Code: $CODE"
+
+          # Login and save cookie
+          LOGIN_CODE=$(curl -s -o /dev/null -w "%{http_code}" -c /tmp/cookie.txt \
+            -X POST -d "code=$CODE" http://localhost:8080/totp-gate/login)
+          echo "Login Response: $LOGIN_CODE"
+
+          if [ "$LOGIN_CODE" != "303" ]; then
+            docker logs test-multi
+            exit 1
+          fi
+
           # Route 1: www.google.com:8080 -> localhost:8080 -> https://www.google.com
-          CODE1=$(curl -s -o /dev/null -w "%{http_code}" \
+          CODE1=$(curl -s -o /dev/null -w "%{http_code}" -b /tmp/cookie.txt \
             --resolve www.google.com:8080:127.0.0.1 \
             http://www.google.com:8080/)
           echo "www.google.com response: $CODE1"
 
           # Route 2: github.com:8080 -> localhost:8080 -> https://github.com
-          CODE2=$(curl -s -o /dev/null -w "%{http_code}" \
+          CODE2=$(curl -s -o /dev/null -w "%{http_code}" -b /tmp/cookie.txt \
             --resolve github.com:8080:127.0.0.1 \
             http://github.com:8080/)
           echo "github.com response: $CODE2"
 
           if [ "$CODE1" -ge 200 ] && [ "$CODE1" -lt 400 ] && \
              [ "$CODE2" -ge 200 ] && [ "$CODE2" -lt 400 ]; then
-            echo "Multi-target HTTPS routing: PASSED"
+            echo "Multi-target HTTPS routing with Auth: PASSED"
           else
             docker logs test-multi
             exit 1
