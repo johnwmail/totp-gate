@@ -63,7 +63,7 @@ type config struct {
 func loadConfig() *config {
 	c := &config{}
 
-	c.listenAddr = envOrDefault("TOTPGATE_AUTH_LISTEN", "0.0.0.0:8080")
+	c.listenAddr = parseListenAddr(envOrDefault("TOTPGATE_AUTH_LISTEN", "0.0.0.0:8080"))
 
 	// Parse multi-target routing if set, otherwise fall back to single upstream.
 	// Format: "host1=http://backend1:port,host2=http://backend2:port"
@@ -161,6 +161,16 @@ func envOrDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func parseListenAddr(v string) string {
+	if strings.HasPrefix(v, ":") {
+		return "0.0.0.0" + v
+	}
+	if _, err := strconv.Atoi(v); err == nil {
+		return "0.0.0.0:" + v
+	}
+	return v
 }
 
 // loadTOTPSecret loads the TOTP secret from file (preferred) or environment variable.
