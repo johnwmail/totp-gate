@@ -46,7 +46,7 @@ All configuration is done via environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TOTPGATE_AUTH_LISTEN` | `:8080` | Address to listen on |
+| `TOTPGATE_AUTH_LISTEN` | `0.0.0.0:8080` | Address to listen on (port or ip:port) |
 | `TOTPGATE_UPSTREAM` | `http://localhost:3000` | Upstream service URL to proxy to |
 | `TOTPGATE_TARGETS` | *(empty)* | Multi-target routing: `host1=upstream1,host2=upstream2`. Overrides `TOTPGATE_UPSTREAM`. |
 | `TOTPGATE_AUTH_DISABLED` | `false` | Disable authentication (bypass mode) |

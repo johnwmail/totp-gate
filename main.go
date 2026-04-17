@@ -11,6 +11,7 @@ import (
 	"encoding/base32"
 	"encoding/binary"
 	"encoding/hex"
+	"flag"
 	"fmt"
 	"hash"
 	"log"
@@ -62,7 +63,7 @@ type config struct {
 func loadConfig() *config {
 	c := &config{}
 
-	c.listenAddr = envOrDefault("TOTPGATE_AUTH_LISTEN", ":8080")
+	c.listenAddr = envOrDefault("TOTPGATE_AUTH_LISTEN", "0.0.0.0:8080")
 
 	// Parse multi-target routing if set, otherwise fall back to single upstream.
 	// Format: "host1=http://backend1:port,host2=http://backend2:port"
@@ -620,10 +621,59 @@ func clientIP(r *http.Request, trustedProxies []*net.IPNet) string {
 // Main
 // ---------------------------------------------------------------------------
 
+func printHelp() {
+	fmt.Println(`TOTP Gate - TOTP-authenticated reverse proxy
+
+Usage:
+  totp-gate [options]
+
+Options:
+  -h, --help    Show this help message
+
+Environment Variables:
+  TOTPGATE_AUTH_LISTEN              Listen address, port or ip:port (default: 0.0.0.0:8080)
+  TOTPGATE_UPSTREAM                Upstream URL (default: http://localhost:3000)
+  TOTPGATE_TARGETS                 Multi-target mode: host1=url1,host2=url2
+  TOTPGATE_TOTP_SECRET             TOTP secret (base32 encoded, required)
+  TOTPGATE_TOTP_SECRET_FILE        Path to TOTP secret file (recommended)
+  TOTPGATE_TOTP_PERIOD             TOTP period in seconds (default: 30)
+  TOTPGATE_TOTP_DIGITS             TOTP code length (default: 6)
+  TOTPGATE_TOTP_ALGORITHM          TOTP algorithm: SHA1, SHA256, SHA512 (default: SHA1)
+  TOTPGATE_AUTH_COOKIE_TTL         Session max lifetime in seconds (default: 86400)
+  TOTPGATE_AUTH_COOKIE_SECURE      Set cookie Secure flag (default: true)
+  TOTPGATE_AUTH_REFRESH_INTERVAL   Activity refresh interval in seconds (default: 600)
+  TOTPGATE_AUTH_DISABLED           Disable authentication (for testing)
+  TOTPGATE_TRUSTED_PROXIES         Comma-separated list of trusted proxy IPs/CIDRs
+  TOTPGATE_INSECURE_SKIP_VERIFY    Skip upstream TLS certificate verification
+
+Examples:
+  # With secret from environment
+  TOTPGATE_TOTP_SECRET=JBSWY3DPEHPK3PXP totp-gate
+
+  # With secret from file (recommended)
+  TOTPGATE_TOTP_SECRET_FILE=/run/secrets/totp totp-gate
+
+  # Custom listen address and upstream
+  TOTPGATE_AUTH_LISTEN=0.0.0.0:9000 TOTPGATE_UPSTREAM=http://backend:8080 totp-gate
+
+  # Multi-target routing
+  TOTPGATE_TARGETS="app1.example.com=http://app1:8080,app2.example.com=http://app2:8080" totp-gate
+
+Version: ` + Version + `, Commit: ` + Commit + `, Built: ` + BuildTime)
+}
+
 func main() {
+	flag.Usage = func() { printHelp() }
+	flag.Parse()
+
+	if flag.NArg() > 0 {
+		printHelp()
+		os.Exit(1)
+	}
+
 	cfg := loadConfig()
 
-	log.Printf("totpgate-auth starting version=%s commit=%s built=%s", Version, Commit, BuildTime)
+	log.Printf("totp-gate starting version=%s commit=%s built=%s", Version, Commit, BuildTime)
 	log.Printf("  listen:          %s", cfg.listenAddr)
 
 	if len(cfg.targets) > 0 {
