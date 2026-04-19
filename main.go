@@ -22,6 +22,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,11 +44,21 @@ var (
 // Configuration
 // ---------------------------------------------------------------------------
 
+// targetEntry represents a single routing rule in multi-target mode.
+// Entries with a path prefix (e.g. host="/api") take precedence over
+// host-only entries; the slice is sorted longest-match-first at parse time.
+type targetEntry struct {
+	host   string   // e.g. "app.example.com" (port-stripped)
+	prefix string   // e.g. "/api" — empty means match all paths for this host
+	url    *url.URL // upstream to forward to
+}
+
 type config struct {
 	listenAddr         string
-	upstreamURL        *url.URL            // fallback (single-target mode)
-	targets            map[string]*url.URL // host → upstream (multi-target mode)
-	totpSecret         []byte              // raw bytes (decoded from base32)
+	upstreamURL        *url.URL      // fallback (single-target mode)
+	targets            []targetEntry // sorted routing rules (multi-target mode)
+	defaultTarget      *url.URL      // explicit default for unmatched requests in multi-target mode
+	totpSecret         []byte        // raw bytes (decoded from base32)
 	totpPeriod         int64
 	totpDigits         int
 	totpAlgo           string // "SHA1", "SHA256", "SHA512"
@@ -66,25 +77,17 @@ func loadConfig() *config {
 	c.listenAddr = parseListenAddr(envOrDefault("TOTPGATE_AUTH_LISTEN", "0.0.0.0:8080"))
 
 	// Parse multi-target routing if set, otherwise fall back to single upstream.
-	// Format: "host1=http://backend1:port,host2=http://backend2:port"
+	// Format: "host/path=http://backend:port,host=http://fallback:port,default=http://default:port"
 	targetsEnv := os.Getenv("TOTPGATE_TARGETS")
 	if targetsEnv != "" {
-		c.targets = parseTargets(targetsEnv)
-		if len(c.targets) == 0 {
+		var defaultURL *url.URL
+		c.targets, defaultURL = parseTargets(targetsEnv)
+		if len(c.targets) == 0 && defaultURL == nil {
 			log.Fatalf("TOTPGATE_TARGETS is set but no valid targets were parsed")
 		}
-		// Single-target: use the sole entry as upstream (no fallback needed).
-		if len(c.targets) == 1 {
-			for _, u := range c.targets {
-				c.upstreamURL = u
-			}
-		} else {
-			// Multi-target: first entry acts as default fallback if Host doesn't match.
-			for _, u := range c.targets {
-				c.upstreamURL = u
-				break
-			}
-		}
+		c.defaultTarget = defaultURL
+		// In single-upstream mode (used when no targets match and no defaultTarget),
+		// upstreamURL stays nil — the proxy handler will return 404.
 	} else {
 		upstream := envOrDefault("TOTPGATE_UPSTREAM", "http://localhost:3000")
 		u, err := url.Parse(upstream)
@@ -263,29 +266,127 @@ func isTrustedProxy(ipStr string, trusted []*net.IPNet) bool {
 	return false
 }
 
-// parseTargets parses the TOTPGATE_TARGETS env var into a host→upstream map.
-// Format: "host1=http://backend1:port,host2=http://backend2:port"
-func parseTargets(env string) map[string]*url.URL {
-	targets := make(map[string]*url.URL)
-	for _, entry := range strings.Split(env, ",") {
-		entry = strings.TrimSpace(entry)
-		if entry == "" {
-			continue
-		}
-		parts := strings.SplitN(entry, "=", 2)
-		if len(parts) != 2 {
-			log.Printf("warning: skipping invalid target %q (expected host=upstream)", entry)
-			continue
-		}
-		host := strings.TrimSpace(parts[0])
-		upstreamURL, err := url.Parse(strings.TrimSpace(parts[1]))
-		if err != nil {
-			log.Printf("warning: skipping target %q: invalid upstream URL: %v", host, err)
-			continue
-		}
-		targets[host] = upstreamURL
+// resolveTarget returns the upstream URL for the given request in multi-target mode.
+// It matches entries in order (longest/most-specific first).
+// Returns nil if no entry matches and no defaultTarget is configured.
+func resolveTarget(cfg *config, r *http.Request) *url.URL {
+	if len(cfg.targets) == 0 {
+		return cfg.upstreamURL
 	}
-	return targets
+
+	host := r.Host
+	if host == "" {
+		host = r.Header.Get("Host")
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	reqPath := r.URL.Path
+
+	for _, entry := range cfg.targets {
+		if entry.host != host {
+			continue
+		}
+		// Host-only entry (empty prefix) matches all paths for this host.
+		// Prefix entry matches when the path starts with the prefix and
+		// is followed by '/' or end-of-string (prevents /apifoo matching /api).
+		if entry.prefix == "" ||
+			(strings.HasPrefix(reqPath, entry.prefix) &&
+				(len(reqPath) == len(entry.prefix) || reqPath[len(entry.prefix)] == '/')) {
+			return entry.url
+		}
+	}
+
+	// No specific rule matched — fall back to defaultTarget (may be nil).
+	return cfg.defaultTarget
+}
+
+// parseTargets parses the TOTPGATE_TARGETS env var into a sorted slice of
+// targetEntry and an optional default upstream URL.
+//
+// Supported key formats:
+//
+//	host                     → matches any path on that host
+//	host/path-prefix         → matches requests on host whose path has the given prefix
+//	default                  → catchall upstream used when no entry matches
+//
+// Example:
+//
+//	app.example.com/api=http://api:8080,app.example.com=http://web:3000,default=http://fallback:9000
+//
+// Rules are sorted longest-key-first so that more specific entries win.
+// Duplicate keys (same host+prefix) cause a fatal error.
+func parseTargets(env string) ([]targetEntry, *url.URL) {
+	var entries []targetEntry
+	var defaultURL *url.URL
+	seen := make(map[string]bool)
+
+	for _, raw := range strings.Split(env, ",") {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		parts := strings.SplitN(raw, "=", 2)
+		if len(parts) != 2 {
+			log.Printf("warning: skipping invalid target %q (expected key=upstream)", raw)
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		upstreamRaw := strings.TrimSpace(parts[1])
+
+		upstreamURL, err := url.Parse(upstreamRaw)
+		if err != nil {
+			log.Printf("warning: skipping target %q: invalid upstream URL: %v", key, err)
+			continue
+		}
+
+		// Special "default" key sets the catchall fallback.
+		if strings.EqualFold(key, "default") {
+			if defaultURL != nil {
+				log.Fatalf("duplicate default target in TOTPGATE_TARGETS")
+			}
+			defaultURL = upstreamURL
+			continue
+		}
+
+		// Split key into host and optional path prefix on the first '/'.
+		var host, prefix string
+		if idx := strings.Index(key, "/"); idx >= 0 {
+			host = key[:idx]
+			prefix = key[idx:] // keeps leading '/'
+		} else {
+			host = key
+			prefix = ""
+		}
+		host = strings.TrimSpace(host)
+		// Normalise: ensure prefix ends without a trailing slash (except root "/")
+		if len(prefix) > 1 {
+			prefix = strings.TrimRight(prefix, "/")
+		}
+
+		dupKey := host + prefix
+		if seen[dupKey] {
+			log.Fatalf("duplicate target %q in TOTPGATE_TARGETS", key)
+		}
+		seen[dupKey] = true
+
+		entries = append(entries, targetEntry{host: host, prefix: prefix, url: upstreamURL})
+	}
+
+	// Sort longest (most specific) first: compare host+prefix length descending.
+	sort.Slice(entries, func(i, j int) bool {
+		li := len(entries[i].host) + len(entries[i].prefix)
+		lj := len(entries[j].host) + len(entries[j].prefix)
+		if li != lj {
+			return li > lj
+		}
+		// Tie-break alphabetically for deterministic output.
+		ki := entries[i].host + entries[i].prefix
+		kj := entries[j].host + entries[j].prefix
+		return ki < kj
+	})
+
+	return entries, defaultURL
 }
 
 // ---------------------------------------------------------------------------
@@ -643,7 +744,11 @@ Options:
 Environment Variables:
   TOTPGATE_AUTH_LISTEN              Listen address, port or ip:port (default: 0.0.0.0:8080)
   TOTPGATE_UPSTREAM                Upstream URL (default: http://localhost:3000)
-  TOTPGATE_TARGETS                 Multi-target mode: host1=url1,host2=url2
+  TOTPGATE_TARGETS                 Multi-target mode: host=url,host/path-prefix=url,default=url
+                                   Keys: "host", "host/path-prefix", or "default" (catchall fallback).
+                                   More specific (longer) rules take precedence.
+                                   Duplicate keys cause a startup error.
+                                   Unmatched requests return 404 when no default is set.
   TOTPGATE_TOTP_SECRET             TOTP secret (base32 encoded, required)
   TOTPGATE_TOTP_SECRET_FILE        Path to TOTP secret file (recommended)
   TOTPGATE_TOTP_PERIOD             TOTP period in seconds (default: 30)
@@ -666,8 +771,14 @@ Examples:
   # Custom listen address and upstream
   TOTPGATE_AUTH_LISTEN=0.0.0.0:9000 TOTPGATE_UPSTREAM=http://backend:8080 totp-gate
 
-  # Multi-target routing
+  # Multi-target routing by host only
   TOTPGATE_TARGETS="app1.example.com=http://app1:8080,app2.example.com=http://app2:8080" totp-gate
+
+  # Multi-target routing with path-prefix rules (more specific rules win)
+  TOTPGATE_TARGETS="app.example.com/api=http://api:8080,app.example.com/static=http://cdn:9000,app.example.com=http://web:3000" totp-gate
+
+  # Multi-target routing with explicit default fallback for unmatched requests
+  TOTPGATE_TARGETS="app.example.com/api=http://api:8080,default=http://fallback:3000" totp-gate
 
 Version: ` + Version + `, Commit: ` + Commit + `, Built: ` + BuildTime)
 }
@@ -687,14 +798,19 @@ func main() {
 	log.Printf("  listen:          %s", cfg.listenAddr)
 
 	if len(cfg.targets) > 0 {
-		// Multi-target mode: show full route table.
-		targetKeys := make([]string, 0, len(cfg.targets))
-		for host := range cfg.targets {
-			targetKeys = append(targetKeys, host)
+		// Multi-target mode: show sorted routing table (most-specific first).
+		log.Printf("  targets (%d, sorted longest-match-first):", len(cfg.targets))
+		for _, e := range cfg.targets {
+			key := e.host + e.prefix
+			if key == "" {
+				key = "(default)"
+			}
+			log.Printf("    %-40s → %s", key, e.url.String())
 		}
-		log.Printf("  targets (%d):", len(cfg.targets))
-		for _, host := range targetKeys {
-			log.Printf("    %-30s → %s", host, cfg.targets[host].String())
+		if cfg.defaultTarget != nil {
+			log.Printf("    %-40s → %s", "default", cfg.defaultTarget.String())
+		} else {
+			log.Printf("    %-40s → %s", "default", "(none — unmatched requests return 404)")
 		}
 	} else {
 		log.Printf("  upstream:        %s", cfg.upstreamURL.String())
@@ -718,27 +834,14 @@ func main() {
 	// Rate limiter: 5 attempts per IP per minute
 	rl := newRateLimiter(5, 1*time.Minute)
 
-	// Reverse proxy with dynamic host-based routing
+	// Reverse proxy with dynamic host/path-prefix routing
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.Out.Header.Set("X-Real-IP", clientIP(r.In, cfg.trustedProxies))
 
-			// Default to fallback upstream
-			r.SetURL(cfg.upstreamURL)
-
-			// If multi-target mode is active, route based on Host header.
-			if len(cfg.targets) > 0 {
-				host := r.In.Host
-				if host == "" {
-					host = r.In.Header.Get("Host")
-				}
-				if h, _, err := net.SplitHostPort(host); err == nil {
-					host = h
-				}
-				if target, ok := cfg.targets[host]; ok {
-					r.SetURL(target)
-				}
-			}
+			// Resolve the target upstream for this request.
+			target := resolveTarget(cfg, r.In)
+			r.SetURL(target)
 
 			// Preserve original Host header for upstream
 			r.Out.Host = r.In.Host
@@ -837,10 +940,13 @@ func main() {
 			}
 		}
 
-		// WebSocket upgrade → hijack
-		// Note: httputil.ReverseProxy handles WebSocket upgrades automatically since Go 1.12.
-
 		// Normal HTTP → reverse proxy
+		// In multi-target mode, check that a route exists before proxying.
+		if len(cfg.targets) > 0 && resolveTarget(cfg, r) == nil {
+			logRequest(r, http.StatusNotFound, "no matching target")
+			http.Error(w, "404 no matching target", http.StatusNotFound)
+			return
+		}
 		proxy.ServeHTTP(w, r)
 	})
 

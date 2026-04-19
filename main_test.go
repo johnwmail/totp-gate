@@ -450,43 +450,259 @@ func TestParseTrustedProxiesBareIP(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Host-Based Routing Tests
+// Host/Path-Prefix Routing Tests
 // ---------------------------------------------------------------------------
 
+// findTarget is a test helper that looks up a host+prefix in a []targetEntry.
+func findTarget(entries []targetEntry, host, prefix string) *url.URL {
+	for _, e := range entries {
+		if e.host == host && e.prefix == prefix {
+			return e.url
+		}
+	}
+	return nil
+}
+
 func TestParseTargets(t *testing.T) {
-	targets := parseTargets("app1.example.com=http://localhost:3000,app2.example.com=http://localhost:4000")
+	entries, defaultURL := parseTargets("app1.example.com=http://localhost:3000,app2.example.com=http://localhost:4000")
 
-	if len(targets) != 2 {
-		t.Fatalf("expected 2 targets, got %d", len(targets))
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 targets, got %d", len(entries))
+	}
+	if defaultURL != nil {
+		t.Errorf("expected no default URL, got %s", defaultURL)
 	}
 
-	if targets["app1.example.com"].String() != "http://localhost:3000" {
-		t.Errorf("unexpected URL for app1: %s", targets["app1.example.com"].String())
+	u1 := findTarget(entries, "app1.example.com", "")
+	if u1 == nil || u1.String() != "http://localhost:3000" {
+		t.Errorf("unexpected URL for app1: %v", u1)
 	}
-	if targets["app2.example.com"].String() != "http://localhost:4000" {
-		t.Errorf("unexpected URL for app2: %s", targets["app2.example.com"].String())
+	u2 := findTarget(entries, "app2.example.com", "")
+	if u2 == nil || u2.String() != "http://localhost:4000" {
+		t.Errorf("unexpected URL for app2: %v", u2)
+	}
+}
+
+func TestParseTargetsWithPathPrefix(t *testing.T) {
+	entries, defaultURL := parseTargets(
+		"app.example.com/api=http://api:8080,app.example.com/static=http://cdn:9000,app.example.com=http://web:3000",
+	)
+
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 targets, got %d", len(entries))
+	}
+	if defaultURL != nil {
+		t.Errorf("expected no default URL, got %s", defaultURL)
+	}
+
+	// Most specific entry first after sort.
+	// "app.example.com/static" and "app.example.com/api" are both len 27; tie-break alpha → /api first.
+	if entries[0].host != "app.example.com" || (entries[0].prefix != "/api" && entries[0].prefix != "/static") {
+		t.Errorf("unexpected first entry: %s%s", entries[0].host, entries[0].prefix)
+	}
+
+	uAPI := findTarget(entries, "app.example.com", "/api")
+	if uAPI == nil || uAPI.String() != "http://api:8080" {
+		t.Errorf("unexpected URL for /api: %v", uAPI)
+	}
+	uStatic := findTarget(entries, "app.example.com", "/static")
+	if uStatic == nil || uStatic.String() != "http://cdn:9000" {
+		t.Errorf("unexpected URL for /static: %v", uStatic)
+	}
+	uRoot := findTarget(entries, "app.example.com", "")
+	if uRoot == nil || uRoot.String() != "http://web:3000" {
+		t.Errorf("unexpected URL for root host: %v", uRoot)
+	}
+}
+
+func TestParseTargetsDefault(t *testing.T) {
+	entries, defaultURL := parseTargets("app.example.com=http://app:8080,default=http://fallback:9000")
+
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 target entry, got %d", len(entries))
+	}
+	if defaultURL == nil || defaultURL.String() != "http://fallback:9000" {
+		t.Errorf("unexpected default URL: %v", defaultURL)
 	}
 }
 
 func TestParseTargetsInvalid(t *testing.T) {
-	targets := parseTargets("invalid-no-equals,app1.example.com=http://localhost:3000")
-	if len(targets) != 1 {
-		t.Fatalf("expected 1 valid target, got %d", len(targets))
+	entries, _ := parseTargets("invalid-no-equals,app1.example.com=http://localhost:3000")
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 valid target, got %d", len(entries))
 	}
-	if _, ok := targets["app1.example.com"]; !ok {
+	if findTarget(entries, "app1.example.com", "") == nil {
 		t.Error("valid target should be present")
 	}
 }
 
 func TestParseTargetsEmpty(t *testing.T) {
-	targets := parseTargets("")
-	if len(targets) != 0 {
-		t.Fatalf("expected 0 targets, got %d", len(targets))
+	entries, defaultURL := parseTargets("")
+	if len(entries) != 0 {
+		t.Fatalf("expected 0 targets, got %d", len(entries))
+	}
+	if defaultURL != nil {
+		t.Errorf("expected nil default URL, got %s", defaultURL)
+	}
+}
+
+func TestParseTargetsSortOrder(t *testing.T) {
+	// Longer keys (more specific) must come first.
+	entries, _ := parseTargets(
+		"app.example.com=http://root:3000,app.example.com/api/v2=http://apiv2:8082,app.example.com/api=http://api:8080",
+	)
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(entries))
+	}
+	// Most specific first: /api/v2 (len 20) > /api (len 16) > "" (len 15)
+	if entries[0].prefix != "/api/v2" {
+		t.Errorf("expected /api/v2 first, got %s", entries[0].prefix)
+	}
+	if entries[1].prefix != "/api" {
+		t.Errorf("expected /api second, got %s", entries[1].prefix)
+	}
+	if entries[2].prefix != "" {
+		t.Errorf("expected empty prefix third, got %s", entries[2].prefix)
+	}
+}
+
+// makeTestConfig builds a minimal *config suitable for routing tests.
+func makeTestConfig(entries []targetEntry, defaultURL *url.URL) *config {
+	return &config{
+		targets:       entries,
+		defaultTarget: defaultURL,
+	}
+}
+
+func TestResolveTargetHostOnly(t *testing.T) {
+	u1, _ := url.Parse("http://backend1:3000")
+	u2, _ := url.Parse("http://backend2:4000")
+	entries := []targetEntry{
+		{host: "app1.example.com", prefix: "", url: u1},
+		{host: "app2.example.com", prefix: "", url: u2},
+	}
+	cfg := makeTestConfig(entries, nil)
+
+	tests := []struct {
+		host     string
+		path     string
+		expected *url.URL
+	}{
+		{"app1.example.com", "/", u1},
+		{"app2.example.com", "/anything", u2},
+		{"app1.example.com:8080", "/", u1}, // port stripped
+		{"unknown.example.com", "/", nil},  // no match, no default → nil
+	}
+	for _, tt := range tests {
+		req := httptest.NewRequest("GET", tt.path, nil)
+		req.Host = tt.host
+		got := resolveTarget(cfg, req)
+		if got != tt.expected {
+			t.Errorf("host=%s path=%s: expected %v, got %v", tt.host, tt.path, tt.expected, got)
+		}
+	}
+}
+
+func TestResolveTargetPathPrefix(t *testing.T) {
+	uAPI, _ := url.Parse("http://api:8080")
+	uWeb, _ := url.Parse("http://web:3000")
+	// Sorted longest-first as parseTargets would produce.
+	entries := []targetEntry{
+		{host: "app.example.com", prefix: "/api", url: uAPI},
+		{host: "app.example.com", prefix: "", url: uWeb},
+	}
+	cfg := makeTestConfig(entries, nil)
+
+	tests := []struct {
+		path     string
+		expected *url.URL
+	}{
+		{"/api", uAPI},
+		{"/api/users", uAPI},
+		{"/api/users/123", uAPI},
+		{"/apifoo", uWeb},    // must NOT match /api prefix
+		{"/", uWeb},
+		{"/other", uWeb},
+	}
+	for _, tt := range tests {
+		req := httptest.NewRequest("GET", tt.path, nil)
+		req.Host = "app.example.com"
+		got := resolveTarget(cfg, req)
+		if got != tt.expected {
+			t.Errorf("path=%s: expected %v, got %v", tt.path, tt.expected, got)
+		}
+	}
+}
+
+func TestResolveTargetLongestPrefixWins(t *testing.T) {
+	uAPIv2, _ := url.Parse("http://apiv2:8082")
+	uAPI, _ := url.Parse("http://api:8080")
+	uWeb, _ := url.Parse("http://web:3000")
+	// Sorted as parseTargets would produce: longest first.
+	entries := []targetEntry{
+		{host: "app.example.com", prefix: "/api/v2", url: uAPIv2},
+		{host: "app.example.com", prefix: "/api", url: uAPI},
+		{host: "app.example.com", prefix: "", url: uWeb},
+	}
+	cfg := makeTestConfig(entries, nil)
+
+	tests := []struct {
+		path     string
+		expected *url.URL
+	}{
+		{"/api/v2/users", uAPIv2},
+		{"/api/v1/users", uAPI},
+		{"/api", uAPI},
+		{"/", uWeb},
+	}
+	for _, tt := range tests {
+		req := httptest.NewRequest("GET", tt.path, nil)
+		req.Host = "app.example.com"
+		got := resolveTarget(cfg, req)
+		if got != tt.expected {
+			t.Errorf("path=%s: expected %v, got %v", tt.path, tt.expected, got)
+		}
+	}
+}
+
+func TestResolveTargetDefaultFallback(t *testing.T) {
+	uApp, _ := url.Parse("http://app:8080")
+	uDefault, _ := url.Parse("http://fallback:9000")
+	entries := []targetEntry{
+		{host: "app.example.com", prefix: "", url: uApp},
+	}
+	cfg := makeTestConfig(entries, uDefault)
+
+	// Known host → matched entry.
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Host = "app.example.com"
+	if got := resolveTarget(cfg, req); got != uApp {
+		t.Errorf("expected app upstream, got %v", got)
+	}
+
+	// Unknown host → defaultTarget.
+	req2 := httptest.NewRequest("GET", "/", nil)
+	req2.Host = "unknown.example.com"
+	if got := resolveTarget(cfg, req2); got != uDefault {
+		t.Errorf("expected default upstream, got %v", got)
+	}
+}
+
+func TestResolveTargetNoMatchNoDefault(t *testing.T) {
+	uApp, _ := url.Parse("http://app:8080")
+	entries := []targetEntry{
+		{host: "app.example.com", prefix: "", url: uApp},
+	}
+	cfg := makeTestConfig(entries, nil)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Host = "other.example.com"
+	if got := resolveTarget(cfg, req); got != nil {
+		t.Errorf("expected nil (no route), got %v", got)
 	}
 }
 
 func TestProxyHostBasedRouting(t *testing.T) {
-	// Create two test backends
 	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("backend1"))
 	}))
@@ -500,57 +716,31 @@ func TestProxyHostBasedRouting(t *testing.T) {
 	u1, _ := url.Parse(backend1.URL)
 	u2, _ := url.Parse(backend2.URL)
 
-	targets := map[string]*url.URL{
-		"app1.example.com": u1,
-		"app2.example.com": u2,
+	entries := []targetEntry{
+		{host: "app1.example.com", prefix: "", url: u1},
+		{host: "app2.example.com", prefix: "", url: u2},
 	}
+	cfg := makeTestConfig(entries, nil)
 
-	// Create proxy with dynamic routing using Rewrite only.
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
-			// Default to first target (fallback).
-			r.SetURL(u1)
-			if len(targets) > 0 {
-				host := r.In.Host
-				if host == "" {
-					host = r.In.Header.Get("Host")
-				}
-				if h, _, err := net.SplitHostPort(host); err == nil {
-					host = h
-				}
-				if target, ok := targets[host]; ok {
-					r.SetURL(target)
-				}
+			target := resolveTarget(cfg, r.In)
+			if target != nil {
+				r.SetURL(target)
 			}
 			r.Out.Header.Set("Host", r.In.Host)
 		},
 	}
 
 	tests := []struct {
-		name     string
-		host     string
-		expected string
+		name         string
+		host         string
+		expectedBody string
+		expectedCode int
 	}{
-		{
-			name:     "routes to backend1",
-			host:     "app1.example.com",
-			expected: "backend1",
-		},
-		{
-			name:     "routes to backend2",
-			host:     "app2.example.com",
-			expected: "backend2",
-		},
-		{
-			name:     "routes to backend1 with port stripped",
-			host:     "app1.example.com:8080",
-			expected: "backend1",
-		},
-		{
-			name:     "unknown host falls back to first target",
-			host:     "unknown.example.com",
-			expected: "backend1",
-		},
+		{"routes to backend1", "app1.example.com", "backend1", http.StatusOK},
+		{"routes to backend2", "app2.example.com", "backend2", http.StatusOK},
+		{"routes to backend1 with port stripped", "app1.example.com:8080", "backend1", http.StatusOK},
 	}
 
 	for _, tt := range tests {
@@ -559,16 +749,70 @@ func TestProxyHostBasedRouting(t *testing.T) {
 			req.Host = tt.host
 			rr := httptest.NewRecorder()
 			proxy.ServeHTTP(rr, req)
+			if rr.Body.String() != tt.expectedBody {
+				t.Errorf("expected body %q, got %q", tt.expectedBody, rr.Body.String())
+			}
+		})
+	}
+}
 
+func TestProxyPathPrefixRouting(t *testing.T) {
+	apiBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("api-backend"))
+	}))
+	defer apiBackend.Close()
+
+	webBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("web-backend"))
+	}))
+	defer webBackend.Close()
+
+	uAPI, _ := url.Parse(apiBackend.URL)
+	uWeb, _ := url.Parse(webBackend.URL)
+
+	// Longest-first order as parseTargets produces.
+	entries := []targetEntry{
+		{host: "app.example.com", prefix: "/api", url: uAPI},
+		{host: "app.example.com", prefix: "", url: uWeb},
+	}
+	cfg := makeTestConfig(entries, nil)
+
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			target := resolveTarget(cfg, r.In)
+			if target != nil {
+				r.SetURL(target)
+			}
+			r.Out.Header.Set("Host", r.In.Host)
+		},
+	}
+
+	tests := []struct {
+		name     string
+		path     string
+		expected string
+	}{
+		{"exact prefix match", "/api", "api-backend"},
+		{"prefix with subpath", "/api/users", "api-backend"},
+		{"non-prefix path", "/", "web-backend"},
+		{"non-prefix other path", "/dashboard", "web-backend"},
+		{"apifoo must not match /api", "/apifoo", "web-backend"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", tt.path, nil)
+			req.Host = "app.example.com"
+			rr := httptest.NewRecorder()
+			proxy.ServeHTTP(rr, req)
 			if rr.Body.String() != tt.expected {
-				t.Errorf("expected body %q, got %q", tt.expected, rr.Body.String())
+				t.Errorf("path=%s: expected %q, got %q", tt.path, tt.expected, rr.Body.String())
 			}
 		})
 	}
 }
 
 func TestProxyWebSocketRouting(t *testing.T) {
-	// Create two backends that detect WebSocket upgrades
 	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Upgrade") == "websocket" {
 			_, _ = w.Write([]byte("ws-backend1"))
@@ -590,25 +834,17 @@ func TestProxyWebSocketRouting(t *testing.T) {
 	u1, _ := url.Parse(backend1.URL)
 	u2, _ := url.Parse(backend2.URL)
 
-	targets := map[string]*url.URL{
-		"app1.example.com": u1,
-		"app2.example.com": u2,
+	entries := []targetEntry{
+		{host: "app1.example.com", prefix: "", url: u1},
+		{host: "app2.example.com", prefix: "", url: u2},
 	}
+	cfg := makeTestConfig(entries, nil)
 
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
-			r.SetURL(u1)
-			if len(targets) > 0 {
-				host := r.In.Host
-				if host == "" {
-					host = r.In.Header.Get("Host")
-				}
-				if h, _, err := net.SplitHostPort(host); err == nil {
-					host = h
-				}
-				if target, ok := targets[host]; ok {
-					r.SetURL(target)
-				}
+			target := resolveTarget(cfg, r.In)
+			if target != nil {
+				r.SetURL(target)
 			}
 			r.Out.Header.Set("Host", r.In.Host)
 		},
@@ -620,42 +856,11 @@ func TestProxyWebSocketRouting(t *testing.T) {
 		upgrade  string
 		expected string
 	}{
-		{
-			name:     "HTTP request routes to backend1",
-			host:     "app1.example.com",
-			upgrade:  "",
-			expected: "http-backend1",
-		},
-		{
-			name:     "HTTP request routes to backend2",
-			host:     "app2.example.com",
-			upgrade:  "",
-			expected: "http-backend2",
-		},
-		{
-			name:     "WebSocket upgrade routes to backend1",
-			host:     "app1.example.com",
-			upgrade:  "websocket",
-			expected: "ws-backend1",
-		},
-		{
-			name:     "WebSocket upgrade routes to backend2",
-			host:     "app2.example.com",
-			upgrade:  "websocket",
-			expected: "ws-backend2",
-		},
-		{
-			name:     "WebSocket with port in Host",
-			host:     "app1.example.com:8080",
-			upgrade:  "websocket",
-			expected: "ws-backend1",
-		},
-		{
-			name:     "Unknown host falls back to first target (WebSocket)",
-			host:     "unknown.example.com",
-			upgrade:  "websocket",
-			expected: "ws-backend1",
-		},
+		{"HTTP request routes to backend1", "app1.example.com", "", "http-backend1"},
+		{"HTTP request routes to backend2", "app2.example.com", "", "http-backend2"},
+		{"WebSocket upgrade routes to backend1", "app1.example.com", "websocket", "ws-backend1"},
+		{"WebSocket upgrade routes to backend2", "app2.example.com", "websocket", "ws-backend2"},
+		{"WebSocket with port in Host", "app1.example.com:8080", "websocket", "ws-backend1"},
 	}
 
 	for _, tt := range tests {

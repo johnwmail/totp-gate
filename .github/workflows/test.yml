@@ -19,9 +19,6 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Download dependencies
-        run: go mod download
-
       - name: Check formatting
         run: |
           unformatted=$(gofmt -l .)
@@ -158,3 +155,117 @@ jobs:
           fi
           echo "Multi-target HTTPS routing with Auth: PASSED"
           docker rm -f test-multi
+
+      - name: Test path-prefix routing with local backends and Auth
+        run: |
+          # Start two simple HTTP backends
+          docker run -d --name backend-api --network host \
+            --entrypoint sh alpine:latest \
+            -c 'while true; do printf "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\napi-reply" | nc -l -p 9001; done'
+          docker run -d --name backend-web --network host \
+            --entrypoint sh alpine:latest \
+            -c 'while true; do printf "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nweb-reply" | nc -l -p 9002; done'
+          sleep 1
+
+          # Start totp-gate with path-prefix targets:
+          #   app.example.com/api -> backend-api (port 9001)
+          #   app.example.com     -> backend-web (port 9002)
+          #   default             -> backend-web (port 9002, fallback for unmatched hosts)
+          docker run -d --name test-prefix \
+            -e TOTPGATE_TARGETS="app.example.com/api=http://localhost:9001,app.example.com=http://localhost:9002,default=http://localhost:9002" \
+            -e TOTPGATE_TOTP_SECRET=JBSWY3DPEHPK3PXP \
+            -e TOTPGATE_AUTH_COOKIE_SECURE=false \
+            --network host \
+            totp-gate:test
+          sleep 3
+
+          # Generate valid TOTP code
+          TOTP_CODE=$(python3 -c "
+          import hmac, hashlib, struct, time, base64
+          def hotp(key, counter, digits=6):
+              key = base64.b32decode(key.upper())
+              msg = struct.pack('>Q', counter)
+              h = hmac.new(key, msg, hashlib.sha1).digest()
+              o = h[19] & 15
+              return str((struct.unpack('>I', h[o:o+4])[0] & 0x7fffffff) % 10**digits).zfill(digits)
+          print(hotp('JBSWY3DPEHPK3PXP', int(time.time()) // 30))
+          ")
+          echo "Generated TOTP Code: $TOTP_CODE"
+
+          # Login and save cookie
+          LOGIN_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -c /tmp/cookie-prefix.txt \
+            -X POST -d "code=$TOTP_CODE" http://localhost:8080/totp-gate/login)
+          echo "Login Status: $LOGIN_STATUS"
+
+          if [ "$LOGIN_STATUS" != "303" ]; then
+            echo "Login failed"
+            docker logs test-prefix
+            docker rm -f test-prefix backend-api backend-web
+            exit 1
+          fi
+
+          # Test 1: /api path routes to api backend
+          HTTP1=$(curl -s -o /dev/null -w "%{http_code}" -b /tmp/cookie-prefix.txt \
+            -H "Host: app.example.com" http://localhost:8080/api)
+          echo "/api response: $HTTP1"
+
+          # Test 2: /api/users (subpath) also routes to api backend
+          HTTP2=$(curl -s -o /dev/null -w "%{http_code}" -b /tmp/cookie-prefix.txt \
+            -H "Host: app.example.com" http://localhost:8080/api/users)
+          echo "/api/users response: $HTTP2"
+
+          # Test 3: / routes to web backend
+          HTTP3=$(curl -s -o /dev/null -w "%{http_code}" -b /tmp/cookie-prefix.txt \
+            -H "Host: app.example.com" http://localhost:8080/)
+          echo "/ response: $HTTP3"
+
+          # Test 4: /apifoo must NOT match /api prefix — routes to web backend
+          HTTP4=$(curl -s -o /dev/null -w "%{http_code}" -b /tmp/cookie-prefix.txt \
+            -H "Host: app.example.com" http://localhost:8080/apifoo)
+          echo "/apifoo response: $HTTP4"
+
+          # Test 5: unknown host with default fallback
+          HTTP5=$(curl -s -o /dev/null -w "%{http_code}" -b /tmp/cookie-prefix.txt \
+            -H "Host: other.example.com" http://localhost:8080/)
+          echo "unknown host with default response: $HTTP5"
+
+          # Test 6: unknown host without default returns 404
+          docker rm -f test-prefix
+          docker run -d --name test-prefix-no-default \
+            -e TOTPGATE_TARGETS="app.example.com/api=http://localhost:9001,app.example.com=http://localhost:9002" \
+            -e TOTPGATE_TOTP_SECRET=JBSWY3DPEHPK3PXP \
+            -e TOTPGATE_AUTH_COOKIE_SECURE=false \
+            --network host \
+            totp-gate:test
+          sleep 3
+
+          TOTP_CODE2=$(python3 -c "
+          import hmac, hashlib, struct, time, base64
+          def hotp(key, counter, digits=6):
+              key = base64.b32decode(key.upper())
+              msg = struct.pack('>Q', counter)
+              h = hmac.new(key, msg, hashlib.sha1).digest()
+              o = h[19] & 15
+              return str((struct.unpack('>I', h[o:o+4])[0] & 0x7fffffff) % 10**digits).zfill(digits)
+          print(hotp('JBSWY3DPEHPK3PXP', int(time.time()) // 30))
+          ")
+          LOGIN_STATUS2=$(curl -s -o /dev/null -w "%{http_code}" -c /tmp/cookie-prefix2.txt \
+            -X POST -d "code=$TOTP_CODE2" http://localhost:8080/totp-gate/login)
+          HTTP6=$(curl -s -o /dev/null -w "%{http_code}" -b /tmp/cookie-prefix2.txt \
+            -H "Host: other.example.com" http://localhost:8080/)
+          echo "unknown host no-default response: $HTTP6"
+
+          FAILED=0
+          [ "$HTTP1" -ne 200 ] && echo "FAIL: /api should return 200" && FAILED=1
+          [ "$HTTP2" -ne 200 ] && echo "FAIL: /api/users should return 200" && FAILED=1
+          [ "$HTTP3" -ne 200 ] && echo "FAIL: / should return 200" && FAILED=1
+          [ "$HTTP4" -ne 200 ] && echo "FAIL: /apifoo should return 200 (web backend)" && FAILED=1
+          [ "$HTTP5" -ne 200 ] && echo "FAIL: unknown host with default should return 200" && FAILED=1
+          [ "$HTTP6" -ne 404 ] && echo "FAIL: unknown host without default should return 404" && FAILED=1
+
+          docker rm -f test-prefix-no-default backend-api backend-web
+
+          if [ "$FAILED" -ne 0 ]; then
+            exit 1
+          fi
+          echo "Path-prefix routing integration test: PASSED"

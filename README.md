@@ -48,7 +48,7 @@ All configuration is done via environment variables:
 |----------|---------|-------------|
 | `TOTPGATE_AUTH_LISTEN` | `0.0.0.0:8080` | Address to listen on (port or ip:port) |
 | `TOTPGATE_UPSTREAM` | `http://localhost:3000` | Upstream service URL to proxy to |
-| `TOTPGATE_TARGETS` | *(empty)* | Multi-target routing: `host1=upstream1,host2=upstream2`. Overrides `TOTPGATE_UPSTREAM`. |
+| `TOTPGATE_TARGETS` | *(empty)* | Multi-target routing: `host=upstream,host/path-prefix=upstream,default=upstream`. Overrides `TOTPGATE_UPSTREAM`. |
 | `TOTPGATE_AUTH_DISABLED` | `false` | Disable authentication (bypass mode) |
 | `TOTPGATE_TOTP_SECRET` | *(required)* | Base32-encoded TOTP secret (fallback) |
 | `TOTPGATE_TOTP_SECRET_FILE` | `/run/secrets/totpgate_totp_secret` | Path to file containing TOTP secret |
@@ -93,16 +93,45 @@ TOTPGATE_INSECURE_SKIP_VERIFY=true
 
 ### Multi-Target Routing
 
-When `TOTPGATE_TARGETS` is set, the gateway routes requests to different upstream services based on the `Host` header:
+When `TOTPGATE_TARGETS` is set, the gateway routes requests to different upstream services based on the `Host` header and optionally the request path prefix.
+
+#### Host-only routing
 
 ```bash
 TOTPGATE_TARGETS="app1.example.com=http://localhost:3000,app2.example.com=http://localhost:4000" ./totp-gate
 ```
 
-**Behavior:**
+#### Path-prefix routing
 
-- The port is stripped from the `Host` before matching (e.g., `app1.example.com:8080` → `app1.example.com`).
-- If no host matches, the **first target** in the list acts as the default fallback — this also covers HTTP/1.0 requests with no `Host` header.
+Route different paths on the same host to different backends:
+
+```bash
+TOTPGATE_TARGETS="app.example.com/api=http://api:8080,app.example.com/static=http://cdn:9000,app.example.com=http://web:3000" ./totp-gate
+```
+
+#### Explicit default fallback
+
+Use the special `default` key to route unmatched requests to a fallback upstream:
+
+```bash
+TOTPGATE_TARGETS="app.example.com/api=http://api:8080,default=http://fallback:3000" ./totp-gate
+```
+
+**Key format:**
+
+| Key | Matches |
+|-----|---------|
+| `host` | All requests on that host |
+| `host/path-prefix` | Requests on that host whose path starts with the prefix |
+| `default` | All requests not matched by any other rule |
+
+**Routing rules:**
+
+- The port is stripped from the `Host` header before matching (e.g., `app.example.com:8080` → `app.example.com`).
+- More specific (longer) rules take precedence — `/api/v2` wins over `/api`, which wins over a host-only entry.
+- `/apifoo` does **not** match the prefix `/api` — the next character after the prefix must be `/` or end-of-string.
+- Duplicate keys (same host+prefix) cause a startup error.
+- If no rule matches and no `default` is set, the request returns **HTTP 404**.
 - WebSocket upgrades are fully supported and routed to the correct backend.
 - `TOTPGATE_UPSTREAM` is ignored when `TOTPGATE_TARGETS` is set.
 
@@ -115,7 +144,7 @@ services:
     ports:
       - "8080:8080"
     environment:
-      TOTPGATE_TARGETS: "app1.example.com=http://app1:3000,app2.example.com=http://app2:4000"
+      TOTPGATE_TARGETS: "app.example.com/api=http://api:8080,app.example.com=http://web:3000,default=http://fallback:9000"
     secrets:
       - totpgate_totp_secret
 secrets:
@@ -136,9 +165,10 @@ Client → totp-gate (:8080) → Upstream Service (:3000)
 ### Multi-Target (via TOTPGATE_TARGETS)
 
 ```
-Client → totp-gate (:8080) ──Host: app1.example.com──→ Service A (:3000)
-              ↑               └──Host: app2.example.com──→ Service B (:4000)
-         TOTP Gate
+Client → totp-gate (:8080) ──Host: app.example.com/api──→ API Service (:8080)
+              ↑               └──Host: app.example.com/static──→ CDN (:9000)
+         TOTP Gate             └──Host: app.example.com──→ Web Service (:3000)
+                               └──(no match)──→ 404 (or default fallback)
 ```
 
 1. User accesses the gateway
@@ -193,13 +223,13 @@ docker service create \
   totp-gate
 ```
 
-Or with multi-target routing:
+Or with multi-target routing (path-prefix example):
 
 ```bash
 docker run -d \
   --name totp-gate \
   -p 8080:8080 \
-  -e TOTPGATE_TARGETS="app1.example.com=http://app1:3000,app2.example.com=http://app2:4000" \
+  -e TOTPGATE_TARGETS="app.example.com/api=http://api:8080,app.example.com=http://web:3000" \
   -e TOTPGATE_TOTP_SECRET="JBSWY3DPEHPK3PXP" \
   johnwmail/totp-gate:latest
 ```
