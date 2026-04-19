@@ -159,18 +159,47 @@ jobs:
       - name: Test path-prefix routing with local backends and Auth
         run: |
           # Start two simple HTTP backends using Python's built-in HTTP server.
-          # We serve from two different directories so each returns a distinct response.
-          mkdir -p /tmp/backend-api /tmp/backend-web
+          # We serve from two different directories so each returns a distinct body.
+          # Create files at the paths the tests will hit so we can check the body.
+          mkdir -p /tmp/backend-api/api/users /tmp/backend-web/apifoo
           echo "api-reply" > /tmp/backend-api/index.html
+          echo "api-reply" > /tmp/backend-api/api/index.html
+          echo "api-reply" > /tmp/backend-api/api/users/index.html
           echo "web-reply" > /tmp/backend-web/index.html
+          echo "web-reply" > /tmp/backend-web/apifoo/index.html
           python3 -m http.server 9001 --directory /tmp/backend-api &
           python3 -m http.server 9002 --directory /tmp/backend-web &
           sleep 1
 
-          # Start totp-gate with path-prefix targets:
-          #   app.example.com/api -> backend-api (port 9001)
-          #   app.example.com     -> backend-web (port 9002)
-          #   default             -> backend-web (port 9002, fallback for unmatched hosts)
+          # Helper: generate a TOTP code
+          gen_totp() {
+            python3 -c "
+          import hmac, hashlib, struct, time, base64
+          def hotp(key, counter, digits=6):
+              key = base64.b32decode(key.upper())
+              msg = struct.pack('>Q', counter)
+              h = hmac.new(key, msg, hashlib.sha1).digest()
+              o = h[19] & 15
+              return str((struct.unpack('>I', h[o:o+4])[0] & 0x7fffffff) % 10**digits).zfill(digits)
+          print(hotp('JBSWY3DPEHPK3PXP', int(time.time()) // 30))
+          "
+          }
+
+          # Helper: login and save cookie to a file, returns 0 on success
+          do_login() {
+            local resolve="$1" cookiefile="$2"
+            local code; code=$(gen_totp)
+            echo "Logging in with code $code (resolve=$resolve, cookie=$cookiefile)"
+            local status
+            status=$(curl -s -o /dev/null -w "%{http_code}" $resolve \
+              -c "$cookiefile" \
+              -X POST -d "code=$code" \
+              http://app.example.com:8080/totp-gate/login)
+            echo "Login status: $status"
+            [ "$status" = "303" ]
+          }
+
+          # --- Phase 1: test routing with default fallback ---
           docker run -d --name test-prefix \
             -e TOTPGATE_TARGETS="app.example.com/api=http://localhost:9001,app.example.com=http://localhost:9002,default=http://localhost:9002" \
             -e TOTPGATE_TOTP_SECRET=JBSWY3DPEHPK3PXP \
@@ -179,70 +208,56 @@ jobs:
             totp-gate:test
           sleep 3
 
-          RESOLVE="--resolve app.example.com:8080:127.0.0.1"
+          RESOLVE_APP="--resolve app.example.com:8080:127.0.0.1"
 
-          # Generate valid TOTP code
-          TOTP_CODE=$(python3 -c "
-          import hmac, hashlib, struct, time, base64
-          def hotp(key, counter, digits=6):
-              key = base64.b32decode(key.upper())
-              msg = struct.pack('>Q', counter)
-              h = hmac.new(key, msg, hashlib.sha1).digest()
-              o = h[19] & 15
-              return str((struct.unpack('>I', h[o:o+4])[0] & 0x7fffffff) % 10**digits).zfill(digits)
-          print(hotp('JBSWY3DPEHPK3PXP', int(time.time()) // 30))
-          ")
-          echo "Generated TOTP Code: $TOTP_CODE"
-
-          # Login via app.example.com (so the cookie is scoped to that domain)
-          LOGIN_STATUS=$(curl -s -o /dev/null -w "%{http_code}" $RESOLVE \
-            -c /tmp/cookie-prefix.txt \
-            -X POST -d "code=$TOTP_CODE" \
-            http://app.example.com:8080/totp-gate/login)
-          echo "Login Status: $LOGIN_STATUS"
-
-          if [ "$LOGIN_STATUS" != "303" ]; then
+          do_login "$RESOLVE_APP" /tmp/cookie-prefix.txt || {
             echo "Login failed"
             docker logs test-prefix
             docker rm -f test-prefix
             kill %1 %2 2>/dev/null || true
             exit 1
-          fi
+          }
 
-          # Test 1: /api routes to api backend
-          HTTP1=$(curl -s -o /dev/null -w "%{http_code}" $RESOLVE \
-            -b /tmp/cookie-prefix.txt \
-            http://app.example.com:8080/api)
-          echo "/api response: $HTTP1"
+          # Test 1: /api/ routes to api backend (check body contains "api-reply")
+          BODY1=$(curl -s $RESOLVE_APP -b /tmp/cookie-prefix.txt \
+            http://app.example.com:8080/api/)
+          echo "/api/ body: $BODY1"
 
-          # Test 2: /api/users (subpath) also routes to api backend
-          HTTP2=$(curl -s -o /dev/null -w "%{http_code}" $RESOLVE \
-            -b /tmp/cookie-prefix.txt \
-            http://app.example.com:8080/api/users)
-          echo "/api/users response: $HTTP2"
+          # Test 2: /api/users/ (subpath) also routes to api backend
+          BODY2=$(curl -s $RESOLVE_APP -b /tmp/cookie-prefix.txt \
+            http://app.example.com:8080/api/users/)
+          echo "/api/users/ body: $BODY2"
 
-          # Test 3: / routes to web backend
-          HTTP3=$(curl -s -o /dev/null -w "%{http_code}" $RESOLVE \
-            -b /tmp/cookie-prefix.txt \
+          # Test 3: / routes to web backend (check body contains "web-reply")
+          BODY3=$(curl -s $RESOLVE_APP -b /tmp/cookie-prefix.txt \
             http://app.example.com:8080/)
-          echo "/ response: $HTTP3"
+          echo "/ body: $BODY3"
 
-          # Test 4: /apifoo must NOT match /api prefix — routes to web backend
-          HTTP4=$(curl -s -o /dev/null -w "%{http_code}" $RESOLVE \
-            -b /tmp/cookie-prefix.txt \
-            http://app.example.com:8080/apifoo)
-          echo "/apifoo response: $HTTP4"
+          # Test 4: /apifoo/ must NOT match /api prefix — routes to web backend
+          BODY4=$(curl -s $RESOLVE_APP -b /tmp/cookie-prefix.txt \
+            http://app.example.com:8080/apifoo/)
+          echo "/apifoo/ body: $BODY4"
 
-          # Test 5: unknown host with default fallback — use other.example.com resolving to same gateway
-          HTTP5=$(curl -s -o /dev/null -w "%{http_code}" \
+          # Test 5: unknown host with default fallback — login via other.example.com first
+          RESOLVE_OTHER="--resolve other.example.com:8080:127.0.0.1"
+          # Reuse app.example.com login endpoint but resolve as other (the login page itself
+          # doesn't care about the host for routing, just sets the cookie for the domain used).
+          # We must login with other.example.com host so the cookie domain matches.
+          CODE5=$(gen_totp)
+          LOGIN5=$(curl -s -o /dev/null -w "%{http_code}" $RESOLVE_OTHER \
             --resolve other.example.com:8080:127.0.0.1 \
-            -b /tmp/cookie-prefix.txt \
+            -c /tmp/cookie-other.txt \
+            -X POST -d "code=$CODE5" \
+            http://other.example.com:8080/totp-gate/login)
+          echo "Login5 status: $LOGIN5"
+          HTTP5=$(curl -s -o /dev/null -w "%{http_code}" $RESOLVE_OTHER \
+            -b /tmp/cookie-other.txt \
             http://other.example.com:8080/)
           echo "unknown host with default response: $HTTP5"
 
           docker rm -f test-prefix
 
-          # Test 6: unknown host without default returns 404 — start new instance without default
+          # --- Phase 2: test unknown host without default returns 404 ---
           docker run -d --name test-prefix-no-default \
             -e TOTPGATE_TARGETS="app.example.com/api=http://localhost:9001,app.example.com=http://localhost:9002" \
             -e TOTPGATE_TOTP_SECRET=JBSWY3DPEHPK3PXP \
@@ -251,33 +266,36 @@ jobs:
             totp-gate:test
           sleep 3
 
-          TOTP_CODE2=$(python3 -c "
-          import hmac, hashlib, struct, time, base64
-          def hotp(key, counter, digits=6):
-              key = base64.b32decode(key.upper())
-              msg = struct.pack('>Q', counter)
-              h = hmac.new(key, msg, hashlib.sha1).digest()
-              o = h[19] & 15
-              return str((struct.unpack('>I', h[o:o+4])[0] & 0x7fffffff) % 10**digits).zfill(digits)
-          print(hotp('JBSWY3DPEHPK3PXP', int(time.time()) // 30))
-          ")
-          LOGIN_STATUS2=$(curl -s -o /dev/null -w "%{http_code}" $RESOLVE \
-            -c /tmp/cookie-prefix2.txt \
-            -X POST -d "code=$TOTP_CODE2" \
-            http://app.example.com:8080/totp-gate/login)
-          echo "Login2 Status: $LOGIN_STATUS2"
+          # Login via app.example.com for the no-default instance
+          do_login "$RESOLVE_APP" /tmp/cookie-prefix2.txt || {
+            echo "Login2 failed"
+            docker logs test-prefix-no-default
+            docker rm -f test-prefix-no-default
+            kill %1 %2 2>/dev/null || true
+            exit 1
+          }
 
-          HTTP6=$(curl -s -o /dev/null -w "%{http_code}" \
-            --resolve other.example.com:8080:127.0.0.1 \
-            -b /tmp/cookie-prefix2.txt \
+          # Test 6: unknown host without default — the auth cookie is for app.example.com,
+          # but other.example.com has no route and no default; the gateway should 404
+          # before even checking auth. Verify using app-domain cookie (won't be sent for
+          # other.example.com, so the gateway will redirect to login — that's a 303, not 404).
+          # Instead: log in via other.example.com then hit it to get 404.
+          CODE6=$(gen_totp)
+          LOGIN6=$(curl -s -o /dev/null -w "%{http_code}" $RESOLVE_OTHER \
+            -c /tmp/cookie-nodefault-other.txt \
+            -X POST -d "code=$CODE6" \
+            http://other.example.com:8080/totp-gate/login)
+          echo "Login6 status: $LOGIN6"
+          HTTP6=$(curl -s -o /dev/null -w "%{http_code}" $RESOLVE_OTHER \
+            -b /tmp/cookie-nodefault-other.txt \
             http://other.example.com:8080/)
           echo "unknown host no-default response: $HTTP6"
 
           FAILED=0
-          [ "$HTTP1" -ne 200 ] && echo "FAIL: /api should return 200, got $HTTP1" && FAILED=1
-          [ "$HTTP2" -ne 200 ] && echo "FAIL: /api/users should return 200, got $HTTP2" && FAILED=1
-          [ "$HTTP3" -ne 200 ] && echo "FAIL: / should return 200, got $HTTP3" && FAILED=1
-          [ "$HTTP4" -ne 200 ] && echo "FAIL: /apifoo should return 200 (web backend), got $HTTP4" && FAILED=1
+          echo "$BODY1" | grep -q "api-reply" || { echo "FAIL: /api/ should reach api backend, body: $BODY1"; FAILED=1; }
+          echo "$BODY2" | grep -q "api-reply" || { echo "FAIL: /api/users/ should reach api backend, body: $BODY2"; FAILED=1; }
+          echo "$BODY3" | grep -q "web-reply" || { echo "FAIL: / should reach web backend, body: $BODY3"; FAILED=1; }
+          echo "$BODY4" | grep -q "web-reply" || { echo "FAIL: /apifoo/ should reach web backend (not api), body: $BODY4"; FAILED=1; }
           [ "$HTTP5" -ne 200 ] && echo "FAIL: unknown host with default should return 200, got $HTTP5" && FAILED=1
           [ "$HTTP6" -ne 404 ] && echo "FAIL: unknown host without default should return 404, got $HTTP6" && FAILED=1
 
