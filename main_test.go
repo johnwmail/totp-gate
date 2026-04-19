@@ -620,7 +620,7 @@ func TestResolveTargetPathPrefix(t *testing.T) {
 		{"/api", uAPI},
 		{"/api/users", uAPI},
 		{"/api/users/123", uAPI},
-		{"/apifoo", uWeb},    // must NOT match /api prefix
+		{"/apifoo", uWeb}, // must NOT match /api prefix
 		{"/", uWeb},
 		{"/other", uWeb},
 	}
