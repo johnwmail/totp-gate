@@ -614,6 +614,7 @@ const loginPageHTML = `<!DOCTYPE html>
     align-items: center;
     justify-content: center;
     min-height: 100vh;
+    padding: 1rem;
   }
   .card {
     background: #16213e;
@@ -624,10 +625,13 @@ const loginPageHTML = `<!DOCTYPE html>
     max-width: 380px;
     box-shadow: 0 8px 32px rgba(0,0,0,0.4);
   }
+  @media (max-width: 420px) {
+    .card { padding: 2rem 1.25rem; border-radius: 8px; }
+  }
   h1 {
     text-align: center;
     font-size: 1.5rem;
-    margin-bottom: 1.5rem;
+    margin-bottom: 0.5rem;
     color: #e94560;
   }
   .error {
@@ -676,11 +680,26 @@ const loginPageHTML = `<!DOCTYPE html>
     transition: background 0.2s;
   }
   button:hover { background: #c73652; }
+  .access-url {
+    text-align: center;
+    font-size: 1rem;
+    color: #a0a0b8;
+    margin-top: 0;
+    margin-bottom: 1.25rem;
+    word-break: break-all;
+    padding: 0.5rem 0.75rem;
+    background: #0d1b2e;
+    border: 1px solid #1a3a5c;
+    border-radius: 6px;
+  }
+  .access-url a { color: #7ab3e0; text-decoration: underline; }
+  .access-url a:hover { color: #add4f5; }
 </style>
 </head>
 <body>
 <div class="card">
   <h1>TOTP Gate Login</h1>
+  {{ACCESS_URL}}
   {{ERROR}}
   <form method="POST" action="/totp-gate/login" autocomplete="off">
     <label for="code">Authentication Code</label>
@@ -691,7 +710,7 @@ const loginPageHTML = `<!DOCTYPE html>
 </body>
 </html>`
 
-func renderLoginPage(digits int, errMsg string) []byte {
+func renderLoginPage(digits int, errMsg string, accessURL string) []byte {
 	html := loginPageHTML
 	html = strings.ReplaceAll(html, "{{DIGITS}}", strconv.Itoa(digits))
 	if errMsg != "" {
@@ -699,7 +718,29 @@ func renderLoginPage(digits int, errMsg string) []byte {
 	} else {
 		html = strings.ReplaceAll(html, "{{ERROR}}", "")
 	}
+	if accessURL != "" {
+		displayURL := accessURL
+		if parsed, err := url.Parse(accessURL); err == nil && (parsed.Path == "" || parsed.Path == "/") && parsed.RawQuery == "" {
+			displayURL = parsed.Scheme + "://" + parsed.Host
+		}
+		display := truncateURL(displayURL, 60)
+		html = strings.ReplaceAll(html, "{{ACCESS_URL}}", `<p class="access-url">`+display+`</p>`)
+	} else {
+		html = strings.ReplaceAll(html, "{{ACCESS_URL}}", "")
+	}
 	return []byte(html)
+}
+
+// truncateURL shortens a URL to at most maxLen characters by replacing the
+// middle with "…", keeping the head and tail roughly equal in length.
+// If the URL is already within maxLen it is returned unchanged.
+func truncateURL(u string, maxLen int) string {
+	if len(u) <= maxLen {
+		return u
+	}
+	tail := maxLen / 2
+	head := maxLen - tail - 1 // 1 for the ellipsis character
+	return u[:head] + "…" + u[len(u)-tail:]
 }
 
 // ---------------------------------------------------------------------------
@@ -866,10 +907,11 @@ func main() {
 
 	// Login page handlers
 	mux.HandleFunc("/totp-gate/login", func(w http.ResponseWriter, r *http.Request) {
+		nextURL := r.URL.Query().Get("next")
 		switch r.Method {
 		case http.MethodGet:
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			if _, err := w.Write(renderLoginPage(cfg.totpDigits, "")); err != nil {
+			if _, err := w.Write(renderLoginPage(cfg.totpDigits, "", nextURL)); err != nil {
 				log.Printf("login page write error: %v", err)
 			}
 
@@ -882,7 +924,7 @@ func main() {
 				logRequest(r, http.StatusTooManyRequests, "rate limited")
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
 				w.WriteHeader(http.StatusTooManyRequests)
-				if _, err := w.Write(renderLoginPage(cfg.totpDigits, "Too many attempts, try again later")); err != nil {
+				if _, err := w.Write(renderLoginPage(cfg.totpDigits, "Too many attempts, try again later", nextURL)); err != nil {
 					log.Printf("rate limit page write error: %v", err)
 				}
 				return
@@ -891,7 +933,7 @@ func main() {
 			if err := r.ParseForm(); err != nil {
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
 				w.WriteHeader(http.StatusBadRequest)
-				if _, err := w.Write(renderLoginPage(cfg.totpDigits, "Invalid request")); err != nil {
+				if _, err := w.Write(renderLoginPage(cfg.totpDigits, "Invalid request", nextURL)); err != nil {
 					log.Printf("error page write error: %v", err)
 				}
 				return
@@ -907,13 +949,17 @@ func main() {
 				// cookieTTL serves as a server-side hard limit checked in validateCookie,
 				// ensuring sessions never exceed the absolute max lifetime from login time.
 				setCookie(w, cfg.cookieKey, cfg.refreshInterval, now, now, cfg.cookieSecure)
-				http.Redirect(w, r, "/", http.StatusSeeOther)
+				redirect := "/"
+				if nextURL != "" {
+					redirect = nextURL
+				}
+				http.Redirect(w, r, redirect, http.StatusSeeOther)
 			} else {
 				log.Printf("login failure from IP %s", ip)
 				logRequest(r, http.StatusUnauthorized, "login failure")
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
 				w.WriteHeader(http.StatusUnauthorized)
-				if _, err := w.Write(renderLoginPage(cfg.totpDigits, "Invalid code. Please try again.")); err != nil {
+				if _, err := w.Write(renderLoginPage(cfg.totpDigits, "Invalid code. Please try again.", nextURL)); err != nil {
 					log.Printf("login failure page write error: %v", err)
 				}
 			}
@@ -929,7 +975,15 @@ func main() {
 		if !cfg.authDisabled {
 			valid, needsRefresh, loginTime, _ := validateCookie(r, cfg.cookieKey, cfg.refreshInterval, cfg.cookieTTL)
 			if !valid {
-				http.Redirect(w, r, "/totp-gate/login", http.StatusSeeOther)
+				scheme := "https"
+				if r.TLS == nil && r.Header.Get("X-Forwarded-Proto") == "" {
+					scheme = "http"
+				} else if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+					scheme = proto
+				}
+				fullURL := scheme + "://" + r.Host + r.RequestURI
+				loginURL := "/totp-gate/login?next=" + url.QueryEscape(fullURL)
+				http.Redirect(w, r, loginURL, http.StatusSeeOther)
 				return
 			}
 			// Refresh cookie if needed (sliding session)

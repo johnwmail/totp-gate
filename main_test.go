@@ -381,13 +381,13 @@ func TestClientIP(t *testing.T) {
 
 func TestLoginPageRendering(t *testing.T) {
 	// Without error
-	html := renderLoginPage(6, "")
+	html := renderLoginPage(6, "", "")
 	if len(html) == 0 {
 		t.Error("login page should not be empty")
 	}
 
 	// With error message
-	html = renderLoginPage(6, "Invalid code")
+	html = renderLoginPage(6, "Invalid code", "")
 	if len(html) == 0 {
 		t.Error("login page with error should not be empty")
 	}
