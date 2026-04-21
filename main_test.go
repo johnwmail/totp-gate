@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/tls"
@@ -321,6 +322,82 @@ func TestCookieSignature(t *testing.T) {
 	valid2, _, _, _ := validateCookie(req2, []byte("wrong-key"), 600, 86400)
 	if valid2 {
 		t.Error("wrong key should fail")
+	}
+}
+
+func TestValidateCookieWithReasonMissing(t *testing.T) {
+	req := httptest.NewRequest("GET", "/", nil)
+
+	result := validateCookieWithReason(req, []byte("key"), 600, 86400)
+	if result.valid {
+		t.Fatal("missing cookie should be invalid")
+	}
+	if result.reason != "missing session cookie" {
+		t.Fatalf("expected missing session cookie reason, got %q", result.reason)
+	}
+}
+
+func TestValidateCookieWithReasonInactivity(t *testing.T) {
+	key := []byte("test-cookie-key-32-bytes-long!!")
+	now := time.Now().Unix()
+
+	rr := httptest.NewRecorder()
+	setCookie(rr, key, 3600, now, now-600, false)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req.AddCookie(rr.Result().Cookies()[0])
+
+	result := validateCookieWithReason(req, key, 600, 86400)
+	if result.valid {
+		t.Fatal("inactive cookie should be invalid")
+	}
+	if result.reason != "session inactivity window exceeded" {
+		t.Fatalf("expected inactivity reason, got %q", result.reason)
+	}
+	if !strings.Contains(result.detail, "inactive=") {
+		t.Fatalf("expected inactivity detail, got %q", result.detail)
+	}
+}
+
+func TestDescribeUpstreamStatus(t *testing.T) {
+	tests := []struct {
+		status int
+		want   string
+	}{
+		{status: http.StatusSwitchingProtocols, want: "upstream protocol switch"},
+		{status: http.StatusOK, want: "proxied response"},
+		{status: http.StatusFound, want: "upstream redirect"},
+		{status: http.StatusBadRequest, want: "upstream client error"},
+		{status: http.StatusBadGateway, want: "upstream server error"},
+		{status: 0, want: "unknown upstream status"},
+	}
+
+	for _, tt := range tests {
+		if got := describeUpstreamStatus(tt.status); got != tt.want {
+			t.Errorf("describeUpstreamStatus(%d) = %q, want %q", tt.status, got, tt.want)
+		}
+	}
+}
+
+func TestDescribeProxyError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "nil", err: nil, want: "unknown proxy error"},
+		{name: "canceled", err: context.Canceled, want: "client canceled request while proxying"},
+		{name: "deadline", err: context.DeadlineExceeded, want: "proxy timeout contacting upstream"},
+		{name: "op error", err: &net.OpError{Op: "dial", Err: fmt.Errorf("connection refused")}, want: "network error contacting upstream"},
+		{name: "unknown", err: fmt.Errorf("boom"), want: "unknown proxy error"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := describeProxyError(tt.err); got != tt.want {
+				t.Fatalf("describeProxyError(%v) = %q, want %q", tt.err, got, tt.want)
+			}
+		})
 	}
 }
 

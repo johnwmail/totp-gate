@@ -12,6 +12,7 @@ import (
 	"encoding/base32"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"hash"
@@ -66,7 +67,7 @@ type config struct {
 	totpAlgo           string // "SHA1", "SHA256", "SHA512"
 	cookieTTL          int    // max session lifetime (seconds)
 	cookieSecure       bool   // secure flag on cookies
-	refreshInterval    int    // activity refresh interval (seconds)
+	refreshInterval    int    // max inactivity window (seconds)
 	authDisabled       bool
 	cookieKey          []byte // derived from totpSecret
 	trustedProxies     []*net.IPNet
@@ -447,6 +448,38 @@ func validateTOTP(secret []byte, code string, digits int, algo string, period in
 // Cookie helpers
 // ---------------------------------------------------------------------------
 
+type cookieValidationResult struct {
+	valid        bool
+	needsRefresh bool
+	loginTime    int64
+	lastActivity int64
+	reason       string
+	detail       string
+}
+
+func formatCookieAge(seconds int64) string {
+	if seconds < 0 {
+		return "-" + (time.Duration(-seconds) * time.Second).String()
+	}
+	return (time.Duration(seconds) * time.Second).String()
+}
+
+func logCookieRejection(r *http.Request, cfg *config, result cookieValidationResult) {
+	ip := clientIP(r, cfg.trustedProxies)
+	scheme := requestScheme(r, cfg.trustedProxies)
+
+	msg := fmt.Sprintf("session rejected from IP %s: %s", ip, result.reason)
+	if result.detail != "" {
+		msg += " (" + result.detail + ")"
+	}
+	if result.reason == "missing session cookie" && cfg.cookieSecure && scheme != "https" {
+		msg += "; Secure cookies are only sent over HTTPS, so verify the external scheme and proxy headers"
+	}
+
+	log.Printf("%s", msg)
+	logRequest(r, http.StatusSeeOther, "auth redirect: "+result.reason)
+}
+
 // setCookie creates a session cookie with expiry and timestamps.
 // Format: <loginTime_hex>.<lastActivity_hex>.<signature_hex>
 func setCookie(w http.ResponseWriter, cookieKey []byte, maxAge int, loginTime int64, lastActivity int64, secure bool) {
@@ -483,29 +516,46 @@ func setCookie(w http.ResponseWriter, cookieKey []byte, maxAge int, loginTime in
 // needsRefresh is always true for valid sessions so callers can persist the latest
 // activity timestamp on each authenticated request.
 func validateCookie(r *http.Request, cookieKey []byte, refreshInterval int, maxLifetime int) (bool, bool, int64, int64) {
+	result := validateCookieWithReason(r, cookieKey, refreshInterval, maxLifetime)
+	return result.valid, result.needsRefresh, result.loginTime, result.lastActivity
+}
+
+func validateCookieWithReason(r *http.Request, cookieKey []byte, refreshInterval int, maxLifetime int) cookieValidationResult {
 	c, err := r.Cookie("totpgate_session")
 	if err != nil {
-		return false, false, 0, 0
+		return cookieValidationResult{reason: "missing session cookie"}
 	}
 
 	parts := strings.SplitN(c.Value, ".", 3)
 	if len(parts) != 3 {
-		return false, false, 0, 0
+		return cookieValidationResult{
+			reason: "malformed session cookie",
+			detail: "expected 3 dot-separated fields",
+		}
 	}
 
 	loginBytes, err := hex.DecodeString(parts[0])
 	if err != nil || len(loginBytes) != 8 {
-		return false, false, 0, 0
+		return cookieValidationResult{
+			reason: "malformed session cookie",
+			detail: "invalid login timestamp encoding",
+		}
 	}
 
 	activityBytes, err := hex.DecodeString(parts[1])
 	if err != nil || len(activityBytes) != 8 {
-		return false, false, 0, 0
+		return cookieValidationResult{
+			reason: "malformed session cookie",
+			detail: "invalid last-activity encoding",
+		}
 	}
 
 	sigBytes, err := hex.DecodeString(parts[2])
 	if err != nil {
-		return false, false, 0, 0
+		return cookieValidationResult{
+			reason: "malformed session cookie",
+			detail: "invalid signature encoding",
+		}
 	}
 
 	// Verify HMAC
@@ -514,7 +564,10 @@ func validateCookie(r *http.Request, cookieKey []byte, refreshInterval int, maxL
 	mac.Write(activityBytes)
 	expectedSig := mac.Sum(nil)
 	if !hmac.Equal(sigBytes, expectedSig) {
-		return false, false, 0, 0
+		return cookieValidationResult{
+			reason: "invalid session cookie",
+			detail: "signature mismatch; this usually means the cookie was tampered with or signed by another instance/key",
+		}
 	}
 
 	loginTime := int64(binary.BigEndian.Uint64(loginBytes))
@@ -523,17 +576,26 @@ func validateCookie(r *http.Request, cookieKey []byte, refreshInterval int, maxL
 
 	// Reject if session has exceeded the hard max lifetime from login.
 	if now-loginTime >= int64(maxLifetime) {
-		return false, false, 0, 0
+		return cookieValidationResult{
+			reason: "session max lifetime exceeded",
+			detail: fmt.Sprintf("age=%s max=%s", formatCookieAge(now-loginTime), formatCookieAge(int64(maxLifetime))),
+		}
 	}
 
 	// Reject if the session has been inactive for longer than refreshInterval.
 	if now-lastActivity >= int64(refreshInterval) {
-		return false, false, 0, 0
+		return cookieValidationResult{
+			reason: "session inactivity window exceeded",
+			detail: fmt.Sprintf("inactive=%s limit=%s", formatCookieAge(now-lastActivity), formatCookieAge(int64(refreshInterval))),
+		}
 	}
 
-	needsRefresh := true
-
-	return true, needsRefresh, loginTime, lastActivity
+	return cookieValidationResult{
+		valid:        true,
+		needsRefresh: true,
+		loginTime:    loginTime,
+		lastActivity: lastActivity,
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -769,8 +831,110 @@ func truncateURL(u string, maxLen int) string {
 // Helpers
 // ---------------------------------------------------------------------------
 
+func logRequestSummary(method, requestURI string, status int, msg string) {
+	if requestURI == "" {
+		requestURI = "/"
+	}
+	log.Printf("[%s] %s %s %d - %s", time.Now().Format(time.RFC3339), method, requestURI, status, msg)
+}
+
+func requestURIForLog(r *http.Request) string {
+	if r == nil || r.URL == nil {
+		return "/"
+	}
+	if requestURI := r.URL.RequestURI(); requestURI != "" {
+		return requestURI
+	}
+	if r.URL.Path != "" {
+		return r.URL.Path
+	}
+	return "/"
+}
+
 func logRequest(r *http.Request, status int, msg string) {
-	log.Printf("[%s] %s %s %d - %s", time.Now().Format(time.RFC3339), r.Method, r.URL.Path, status, msg)
+	logRequestSummary(r.Method, requestURIForLog(r), status, msg)
+}
+
+func targetForLog(target *url.URL) string {
+	if target == nil {
+		return "unknown upstream"
+	}
+	if target.Scheme == "" && target.Host == "" {
+		return "unknown upstream"
+	}
+	return (&url.URL{Scheme: target.Scheme, Host: target.Host}).String()
+}
+
+func describeUpstreamStatus(status int) string {
+	switch {
+	case status >= 500:
+		return "upstream server error"
+	case status >= 400:
+		return "upstream client error"
+	case status >= 300:
+		return "upstream redirect"
+	case status >= 200:
+		return "proxied response"
+	case status >= 100:
+		return "upstream protocol switch"
+	default:
+		return "unknown upstream status"
+	}
+}
+
+func describeProxyError(err error) string {
+	if err == nil {
+		return "unknown proxy error"
+	}
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "client canceled request while proxying"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "proxy timeout contacting upstream"
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "proxy timeout contacting upstream"
+	}
+
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return "network error contacting upstream"
+	}
+
+	return "unknown proxy error"
+}
+
+func logProxyResponse(resp *http.Response) error {
+	target := targetForLog(resp.Request.URL)
+	client := strings.TrimSpace(resp.Request.Header.Get("X-Real-IP"))
+	if client == "" {
+		client = "unknown"
+	}
+
+	statusText := http.StatusText(resp.StatusCode)
+	if statusText == "" {
+		statusText = "Unknown Status"
+	}
+
+	log.Printf("proxy response to IP %s from %s: %d %s", client, target, resp.StatusCode, statusText)
+	logRequestSummary(resp.Request.Method, requestURIForLog(resp.Request), resp.StatusCode, describeUpstreamStatus(resp.StatusCode)+" via "+target)
+
+	return nil
+}
+
+func logProxyError(r *http.Request, cfg *config, err error) {
+	target := targetForLog(resolveTarget(cfg, r))
+	reason := describeProxyError(err)
+	ip := clientIP(r, cfg.trustedProxies)
+	msg := reason + " via " + target
+	if err != nil {
+		msg += ": " + err.Error()
+	}
+
+	log.Printf("proxy error for IP %s: %s", ip, msg)
+	logRequest(r, http.StatusBadGateway, msg)
 }
 
 func remoteAddrHost(remoteAddr string) string {
@@ -908,7 +1072,7 @@ Environment Variables:
   TOTPGATE_TOTP_ALGORITHM          TOTP algorithm: SHA1, SHA256, SHA512 (default: SHA1)
   TOTPGATE_AUTH_COOKIE_TTL         Session max lifetime in seconds (default: 86400)
   TOTPGATE_AUTH_COOKIE_SECURE      Set cookie Secure flag (default: true)
-  TOTPGATE_AUTH_REFRESH_INTERVAL   Activity refresh interval in seconds (default: 600)
+  TOTPGATE_AUTH_REFRESH_INTERVAL   Max inactivity window in seconds (default: 600)
   TOTPGATE_AUTH_DISABLED           Disable authentication (for testing)
   TOTPGATE_TRUSTED_PROXIES         Comma-separated list of trusted proxy IPs/CIDRs
   TOTPGATE_INSECURE_SKIP_VERIFY    Skip upstream TLS certificate verification
@@ -973,7 +1137,7 @@ func main() {
 	log.Printf("  auth_disabled:   %v", cfg.authDisabled)
 	log.Printf("  cookie_ttl:      %d", cfg.cookieTTL)
 	log.Printf("  cookie_secure:   %v", cfg.cookieSecure)
-	log.Printf("  refresh_interval: %d", cfg.refreshInterval)
+	log.Printf("  refresh_interval: %d (max inactivity window)", cfg.refreshInterval)
 
 	// Log trusted proxy networks (for debugging forwarded-header trust)
 	trustedStrs := make([]string, len(cfg.trustedProxies))
@@ -999,6 +1163,11 @@ func main() {
 			r.Out.Host = r.In.Host
 			r.Out.Header.Set("Host", r.In.Host)
 		},
+		ModifyResponse: logProxyResponse,
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			logProxyError(r, cfg, err)
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+		},
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: cfg.insecureSkipVerify, // nolint:gosec
@@ -1010,6 +1179,7 @@ func main() {
 
 	// Health endpoint
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		logRequest(r, http.StatusOK, "health check")
 		w.WriteHeader(http.StatusOK)
 		if _, err := w.Write([]byte("OK")); err != nil {
 			log.Printf("health endpoint write error: %v", err)
@@ -1020,16 +1190,16 @@ func main() {
 	mux.HandleFunc("/totp-gate/login", func(w http.ResponseWriter, r *http.Request) {
 		nextURL := sanitizeNextURL(r.URL.Query().Get("next"))
 		displayURL := accessURL(r, nextURL, cfg.trustedProxies)
+		ip := clientIP(r, cfg.trustedProxies)
 		switch r.Method {
 		case http.MethodGet:
+			logRequest(r, http.StatusOK, "login page served")
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			if _, err := w.Write(renderLoginPage(cfg.totpDigits, "", displayURL)); err != nil {
 				log.Printf("login page write error: %v", err)
 			}
 
 		case http.MethodPost:
-			ip := clientIP(r, cfg.trustedProxies)
-
 			// Rate limit check
 			if !rl.allow(ip) {
 				log.Printf("rate-limit hit for IP %s", ip)
@@ -1043,6 +1213,8 @@ func main() {
 			}
 
 			if err := r.ParseForm(); err != nil {
+				log.Printf("login form parse error from IP %s: %v", ip, err)
+				logRequest(r, http.StatusBadRequest, "invalid login form")
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
 				w.WriteHeader(http.StatusBadRequest)
 				if _, err := w.Write(renderLoginPage(cfg.totpDigits, "Invalid request", displayURL)); err != nil {
@@ -1054,7 +1226,6 @@ func main() {
 			submittedCode := strings.TrimSpace(r.FormValue("code"))
 			if validateTOTP(cfg.totpSecret, submittedCode, cfg.totpDigits, cfg.totpAlgo, cfg.totpPeriod) {
 				log.Printf("login success from IP %s", ip)
-				logRequest(r, http.StatusOK, "login success")
 				now := time.Now().Unix()
 				// Keep the cookie in the browser for the full session lifetime.
 				// Sliding inactivity is enforced server-side in validateCookie.
@@ -1063,6 +1234,7 @@ func main() {
 				if nextURL != "" {
 					redirect = nextURL
 				}
+				logRequest(r, http.StatusSeeOther, "login success; redirecting to "+redirect)
 				http.Redirect(w, r, redirect, http.StatusSeeOther)
 			} else {
 				log.Printf("login failure from IP %s", ip)
@@ -1075,6 +1247,7 @@ func main() {
 			}
 
 		default:
+			logRequest(r, http.StatusMethodNotAllowed, "login method not allowed")
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
@@ -1083,8 +1256,9 @@ func main() {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		// Auth check (unless disabled)
 		if !cfg.authDisabled {
-			valid, needsRefresh, loginTime, _ := validateCookie(r, cfg.cookieKey, cfg.refreshInterval, cfg.cookieTTL)
-			if !valid {
+			cookieResult := validateCookieWithReason(r, cfg.cookieKey, cfg.refreshInterval, cfg.cookieTTL)
+			if !cookieResult.valid {
+				logCookieRejection(r, cfg, cookieResult)
 				nextURL := sanitizeNextURL(r.URL.RequestURI())
 				if nextURL == "" {
 					nextURL = "/"
@@ -1094,8 +1268,8 @@ func main() {
 				return
 			}
 			// Persist the latest activity timestamp for sliding inactivity enforcement.
-			if needsRefresh {
-				setCookie(w, cfg.cookieKey, cfg.cookieTTL, loginTime, time.Now().Unix(), cfg.cookieSecure)
+			if cookieResult.needsRefresh {
+				setCookie(w, cfg.cookieKey, cfg.cookieTTL, cookieResult.loginTime, time.Now().Unix(), cfg.cookieSecure)
 			}
 		}
 
@@ -1106,6 +1280,7 @@ func main() {
 			http.Error(w, "404 no matching target", http.StatusNotFound)
 			return
 		}
+		log.Printf("proxying request from IP %s to %s", clientIP(r, cfg.trustedProxies), targetForLog(resolveTarget(cfg, r)))
 		proxy.ServeHTTP(w, r)
 	})
 

@@ -57,7 +57,7 @@ All configuration is done via environment variables:
 | `TOTPGATE_TOTP_ALGORITHM` | `SHA1` | Hash algorithm: `SHA1`, `SHA256`, `SHA512` |
 | `TOTPGATE_AUTH_COOKIE_TTL` | `86400` | Max session lifetime in seconds (24h) |
 | `TOTPGATE_AUTH_COOKIE_SECURE` | `true` | Set `Secure` flag on cookies (set `false` for local dev/test with HTTP-only) |
-| `TOTPGATE_AUTH_REFRESH_INTERVAL` | `600` | Activity refresh interval in seconds (10m) |
+| `TOTPGATE_AUTH_REFRESH_INTERVAL` | `600` | Max inactivity window in seconds (10m) |
 | `TOTPGATE_TRUSTED_PROXIES` | *(see below)* | Comma-separated trusted proxy IPs or CIDRs for forwarded-header trust |
 | `TOTPGATE_INSECURE_SKIP_VERIFY` | `false` | Skip TLS certificate verification for `https://` upstream targets (dev/testing only) |
 
@@ -180,7 +180,7 @@ Client → totp-gate (:8080) ──Host: app.example.com/api──→ API Servic
 ### Session Management
 
 - **Max Lifetime**: Sessions expire after `TOTPGATE_AUTH_COOKIE_TTL` (default 24h) from login time
-- **Activity Refresh**: Cookie activity is refreshed every `TOTPGATE_AUTH_REFRESH_INTERVAL` (default 10m) of activity
+- **Inactivity Window**: Sessions expire after `TOTPGATE_AUTH_REFRESH_INTERVAL` without any authenticated request
 - **Security**: Cookies are HMAC-signed with a key derived from the TOTP secret + random nonce (regenerated on each restart, invalidating all sessions)
 
 ## Endpoints
