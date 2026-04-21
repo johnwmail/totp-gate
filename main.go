@@ -473,7 +473,13 @@ func setCookie(w http.ResponseWriter, cookieKey []byte, maxAge int, loginTime in
 }
 
 // validateCookie checks the session cookie and returns (valid, needsRefresh, loginTime, lastActivity).
-// needsRefresh is true if the session is valid but should be refreshed (last activity > refreshInterval ago).
+//
+// Expiry rules enforced server-side:
+//   - Session is invalid if now-loginTime >= maxLifetime.
+//   - Session is invalid if now-lastActivity >= refreshInterval.
+//
+// needsRefresh is always true for valid sessions so callers can persist the latest
+// activity timestamp on each authenticated request.
 func validateCookie(r *http.Request, cookieKey []byte, refreshInterval int, maxLifetime int) (bool, bool, int64, int64) {
 	c, err := r.Cookie("totpgate_session")
 	if err != nil {
@@ -513,14 +519,17 @@ func validateCookie(r *http.Request, cookieKey []byte, refreshInterval int, maxL
 	lastActivity := int64(binary.BigEndian.Uint64(activityBytes))
 	now := time.Now().Unix()
 
-	// Check if session has exceeded max lifetime (24h from login)
-	if now-loginTime > int64(maxLifetime) {
-		// Session expired - max lifetime exceeded
+	// Reject if session has exceeded the hard max lifetime from login.
+	if now-loginTime >= int64(maxLifetime) {
 		return false, false, 0, 0
 	}
 
-	// Check if refresh is needed (activity older than refreshInterval)
-	needsRefresh := (now - lastActivity) > int64(refreshInterval)
+	// Reject if the session has been inactive for longer than refreshInterval.
+	if now-lastActivity >= int64(refreshInterval) {
+		return false, false, 0, 0
+	}
+
+	needsRefresh := true
 
 	return true, needsRefresh, loginTime, lastActivity
 }
@@ -944,11 +953,9 @@ func main() {
 				log.Printf("login success from IP %s", ip)
 				logRequest(r, http.StatusOK, "login success")
 				now := time.Now().Unix()
-				// Use refreshInterval as cookie MaxAge (client-side inactivity timeout).
-				// The browser discards the cookie after this period of inactivity.
-				// cookieTTL serves as a server-side hard limit checked in validateCookie,
-				// ensuring sessions never exceed the absolute max lifetime from login time.
-				setCookie(w, cfg.cookieKey, cfg.refreshInterval, now, now, cfg.cookieSecure)
+				// Keep the cookie in the browser for the full session lifetime.
+				// Sliding inactivity is enforced server-side in validateCookie.
+				setCookie(w, cfg.cookieKey, cfg.cookieTTL, now, now, cfg.cookieSecure)
 				redirect := "/"
 				if nextURL != "" {
 					redirect = nextURL
@@ -986,11 +993,9 @@ func main() {
 				http.Redirect(w, r, loginURL, http.StatusSeeOther)
 				return
 			}
-			// Refresh cookie if needed (sliding session)
+			// Persist the latest activity timestamp for sliding inactivity enforcement.
 			if needsRefresh {
-				// Renew the client-side inactivity timer (refreshInterval) while
-				// preserving the original loginTime for the server-side hard limit (cookieTTL).
-				setCookie(w, cfg.cookieKey, cfg.refreshInterval, loginTime, time.Now().Unix(), cfg.cookieSecure)
+				setCookie(w, cfg.cookieKey, cfg.cookieTTL, loginTime, time.Now().Unix(), cfg.cookieSecure)
 			}
 		}
 

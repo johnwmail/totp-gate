@@ -127,8 +127,8 @@ func TestCookieRoundTrip(t *testing.T) {
 	if !valid {
 		t.Error("fresh cookie should be valid")
 	}
-	if needsRefresh {
-		t.Error("fresh cookie should not need refresh immediately")
+	if !needsRefresh {
+		t.Error("fresh cookie should persist activity immediately")
 	}
 	if loginTime != now {
 		t.Errorf("expected loginTime %d, got %d", now, loginTime)
@@ -180,7 +180,7 @@ func TestTamperedCookie(t *testing.T) {
 func TestCookieNeedsRefresh(t *testing.T) {
 	key := []byte("test-cookie-key-32-bytes-long!!")
 	now := time.Now().Unix()
-	oldActivity := now - 1200
+	oldActivity := now - 300
 
 	rr := httptest.NewRecorder()
 	setCookie(rr, key, 3600, now, oldActivity, false)
@@ -193,10 +193,94 @@ func TestCookieNeedsRefresh(t *testing.T) {
 		t.Error("cookie should be valid")
 	}
 	if !needsRefresh {
-		t.Error("old activity should trigger refresh")
+		t.Error("valid session should persist latest activity")
 	}
 	if loginTime != now {
 		t.Errorf("expected loginTime %d, got %d", now, loginTime)
+	}
+}
+
+func TestCookieInactivityExpiry(t *testing.T) {
+	key := []byte("test-cookie-key-32-bytes-long!!")
+	now := time.Now().Unix()
+	inactiveActivity := now - 600
+
+	rr := httptest.NewRecorder()
+	setCookie(rr, key, 3600, now, inactiveActivity, false)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req.AddCookie(rr.Result().Cookies()[0])
+
+	valid, _, _, _ := validateCookie(req, key, 600, 86400)
+	if valid {
+		t.Error("session inactive for >= refreshInterval should be rejected")
+	}
+}
+
+func TestCookieMaxLifetimeBoundary(t *testing.T) {
+	key := []byte("test-cookie-key-32-bytes-long!!")
+	now := time.Now().Unix()
+	loginTime := now - 86400
+
+	rr := httptest.NewRecorder()
+	setCookie(rr, key, 86400, loginTime, now, false)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req.AddCookie(rr.Result().Cookies()[0])
+
+	valid, _, _, _ := validateCookie(req, key, 600, 86400)
+	if valid {
+		t.Error("session at exactly maxLifetime should be rejected")
+	}
+}
+
+func TestCookiePreservesActivityAcrossRequests(t *testing.T) {
+	key := []byte("test-cookie-key-32-bytes-long!!")
+	now := time.Now().Unix()
+	loginTime := now - 700
+	firstActivity := now - 301
+
+	firstResp := httptest.NewRecorder()
+	setCookie(firstResp, key, 30*24*3600, loginTime, firstActivity, false)
+
+	firstReq := httptest.NewRequest("GET", "/", nil)
+	firstReq.AddCookie(firstResp.Result().Cookies()[0])
+
+	valid, needsRefresh, gotLogin, _ := validateCookie(firstReq, key, 600, 30*24*3600)
+	if !valid {
+		t.Fatal("expected first request to be valid")
+	}
+	if !needsRefresh {
+		t.Fatal("expected valid request to persist activity")
+	}
+	if gotLogin != loginTime {
+		t.Fatalf("loginTime should be preserved: got %d want %d", gotLogin, loginTime)
+	}
+
+	updatedActivity := now - 1
+	secondResp := httptest.NewRecorder()
+	setCookie(secondResp, key, 30*24*3600, loginTime, updatedActivity, false)
+
+	secondReq := httptest.NewRequest("GET", "/", nil)
+	secondReq.AddCookie(secondResp.Result().Cookies()[0])
+
+	valid, _, _, _ = validateCookie(secondReq, key, 600, 30*24*3600)
+	if !valid {
+		t.Fatal("expected follow-up request to remain valid after activity refresh")
+	}
+}
+
+func TestSetCookieUsesConfiguredMaxAge(t *testing.T) {
+	key := []byte("test-cookie-key-32-bytes-long!!")
+	rr := httptest.NewRecorder()
+	setCookie(rr, key, 30*24*3600, 1, 1, false)
+
+	cookies := rr.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("expected 1 cookie, got %d", len(cookies))
+	}
+	if cookies[0].MaxAge != 30*24*3600 {
+		t.Fatalf("expected MaxAge %d, got %d", 30*24*3600, cookies[0].MaxAge)
 	}
 }
 
