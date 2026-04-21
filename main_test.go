@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base32"
 	"encoding/binary"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -416,10 +418,17 @@ func TestClientIP(t *testing.T) {
 		},
 		{
 			name:     "X-Forwarded-For from trusted proxy",
+			headers:  map[string]string{"X-Forwarded-For": "4.4.4.4"},
+			remote:   "10.0.0.1:8080",
+			trusted:  trusted,
+			expected: "4.4.4.4",
+		},
+		{
+			name:     "X-Forwarded-For ignores spoofed leftmost entry",
 			headers:  map[string]string{"X-Forwarded-For": "3.3.3.3, 4.4.4.4"},
 			remote:   "10.0.0.1:8080",
 			trusted:  trusted,
-			expected: "3.3.3.3",
+			expected: "4.4.4.4",
 		},
 		{
 			name:     "Headers ignored from untrusted peer",
@@ -465,15 +474,101 @@ func TestClientIP(t *testing.T) {
 
 func TestLoginPageRendering(t *testing.T) {
 	// Without error
-	html := renderLoginPage(6, "", "")
+	html := string(renderLoginPage(6, "", ""))
 	if len(html) == 0 {
 		t.Error("login page should not be empty")
 	}
 
 	// With error message
-	html = renderLoginPage(6, "Invalid code", "")
+	html = string(renderLoginPage(6, "Invalid code", ""))
 	if len(html) == 0 {
 		t.Error("login page with error should not be empty")
+	}
+
+	escaped := string(renderLoginPage(6, "", `https://example.com/"><script>alert(1)</script>`))
+	if strings.Contains(escaped, `<script>alert(1)</script>`) {
+		t.Error("login page should escape access URL content")
+	}
+	if !strings.Contains(escaped, "&lt;script&gt;alert(1)&lt;/script&gt;") {
+		t.Error("escaped access URL should still be visible to the user")
+	}
+}
+
+func TestSanitizeNextURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		raw      string
+		expected string
+	}{
+		{name: "root path", raw: "/", expected: "/"},
+		{name: "relative path with query", raw: "/dashboard?tab=1", expected: "/dashboard?tab=1"},
+		{name: "relative path with fragment", raw: "/docs#top", expected: "/docs#top"},
+		{name: "reject empty", raw: "", expected: ""},
+		{name: "reject absolute url", raw: "https://evil.example/phish", expected: ""},
+		{name: "reject scheme relative", raw: "//evil.example/phish", expected: ""},
+		{name: "reject path traversal without leading slash", raw: "dashboard", expected: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sanitizeNextURL(tt.raw); got != tt.expected {
+				t.Errorf("sanitizeNextURL(%q) = %q, want %q", tt.raw, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestRequestScheme(t *testing.T) {
+	trusted := parseTrustedProxies("10.0.0.0/8")
+
+	tests := []struct {
+		name     string
+		remote   string
+		headers  map[string]string
+		tls      bool
+		expected string
+	}{
+		{
+			name:     "tls request is https",
+			remote:   "203.0.113.5:443",
+			tls:      true,
+			expected: "https",
+		},
+		{
+			name:     "trusted proxy can set forwarded proto",
+			remote:   "10.0.0.1:8080",
+			headers:  map[string]string{"X-Forwarded-Proto": "https"},
+			expected: "https",
+		},
+		{
+			name:     "untrusted peer cannot set forwarded proto",
+			remote:   "203.0.113.5:8080",
+			headers:  map[string]string{"X-Forwarded-Proto": "https"},
+			expected: "http",
+		},
+		{
+			name:     "invalid forwarded proto falls back to http",
+			remote:   "10.0.0.1:8080",
+			headers:  map[string]string{"X-Forwarded-Proto": "javascript"},
+			expected: "http",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/", nil)
+			req.RemoteAddr = tt.remote
+			for k, v := range tt.headers {
+				req.Header.Set(k, v)
+			}
+			if tt.tls {
+				req.TLS = &tls.ConnectionState{}
+			}
+
+			if got := requestScheme(req, trusted); got != tt.expected {
+				t.Errorf("requestScheme() = %q, want %q", got, tt.expected)
+			}
+		})
 	}
 }
 

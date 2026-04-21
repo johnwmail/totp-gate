@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -14,6 +15,7 @@ import (
 	"flag"
 	"fmt"
 	"hash"
+	"html/template"
 	"log"
 	"math"
 	"net"
@@ -708,36 +710,47 @@ const loginPageHTML = `<!DOCTYPE html>
 <body>
 <div class="card">
   <h1>TOTP Gate Login</h1>
-  {{ACCESS_URL}}
-  {{ERROR}}
+  {{if .AccessURL}}<p class="access-url">{{.AccessURL}}</p>{{end}}
+  {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
   <form method="POST" action="/totp-gate/login" autocomplete="off">
     <label for="code">Authentication Code</label>
-    <input type="text" id="code" name="code" maxlength="{{DIGITS}}" pattern="[0-9]*" inputmode="numeric" autofocus required>
+    <input type="text" id="code" name="code" maxlength="{{.Digits}}" pattern="[0-9]*" inputmode="numeric" autofocus required>
     <button type="submit">Sign In</button>
   </form>
 </div>
 </body>
 </html>`
 
+type loginPageData struct {
+	Digits    int
+	Error     string
+	AccessURL string
+}
+
+var loginPageTemplate = template.Must(template.New("login-page").Parse(loginPageHTML))
+
 func renderLoginPage(digits int, errMsg string, accessURL string) []byte {
-	html := loginPageHTML
-	html = strings.ReplaceAll(html, "{{DIGITS}}", strconv.Itoa(digits))
-	if errMsg != "" {
-		html = strings.ReplaceAll(html, "{{ERROR}}", `<div class="error">`+errMsg+`</div>`)
-	} else {
-		html = strings.ReplaceAll(html, "{{ERROR}}", "")
-	}
+	displayURL := accessURL
 	if accessURL != "" {
-		displayURL := accessURL
 		if parsed, err := url.Parse(accessURL); err == nil && (parsed.Path == "" || parsed.Path == "/") && parsed.RawQuery == "" {
 			displayURL = parsed.Scheme + "://" + parsed.Host
 		}
-		display := truncateURL(displayURL, 60)
-		html = strings.ReplaceAll(html, "{{ACCESS_URL}}", `<p class="access-url">`+display+`</p>`)
-	} else {
-		html = strings.ReplaceAll(html, "{{ACCESS_URL}}", "")
 	}
-	return []byte(html)
+	if displayURL != "" {
+		displayURL = truncateURL(displayURL, 60)
+	}
+
+	var buf bytes.Buffer
+	if err := loginPageTemplate.Execute(&buf, loginPageData{
+		Digits:    digits,
+		Error:     errMsg,
+		AccessURL: displayURL,
+	}); err != nil {
+		log.Printf("login page render error: %v", err)
+		return []byte("internal server error")
+	}
+
+	return buf.Bytes()
 }
 
 // truncateURL shortens a URL to at most maxLen characters by replacing the
@@ -760,19 +773,108 @@ func logRequest(r *http.Request, status int, msg string) {
 	log.Printf("[%s] %s %s %d - %s", time.Now().Format(time.RFC3339), r.Method, r.URL.Path, status, msg)
 }
 
-func clientIP(r *http.Request, trustedProxies []*net.IPNet) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
+func remoteAddrHost(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
-		host = r.RemoteAddr
+		host = remoteAddr
 	}
+	return host
+}
+
+func parseIPToken(v string) net.IP {
+	token := strings.TrimSpace(v)
+	if token == "" {
+		return nil
+	}
+	if host, _, err := net.SplitHostPort(token); err == nil {
+		token = host
+	}
+	return net.ParseIP(strings.Trim(token, "[]"))
+}
+
+func requestScheme(r *http.Request, trustedProxies []*net.IPNet) string {
+	if r.TLS != nil {
+		return "https"
+	}
+	if isTrustedProxy(remoteAddrHost(r.RemoteAddr), trustedProxies) {
+		proto := strings.TrimSpace(strings.SplitN(r.Header.Get("X-Forwarded-Proto"), ",", 2)[0])
+		switch strings.ToLower(proto) {
+		case "http", "https":
+			return strings.ToLower(proto)
+		}
+	}
+	return "http"
+}
+
+func sanitizeNextURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || !strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, "//") {
+		return ""
+	}
+
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	if parsed.IsAbs() || parsed.Host != "" || parsed.Scheme != "" || parsed.User != nil {
+		return ""
+	}
+
+	path := parsed.EscapedPath()
+	if path == "" {
+		path = "/"
+	}
+	if !strings.HasPrefix(path, "/") || strings.HasPrefix(path, "//") {
+		return ""
+	}
+
+	next := path
+	if parsed.RawQuery != "" {
+		next += "?" + parsed.RawQuery
+	}
+	if parsed.Fragment != "" {
+		next += "#" + parsed.Fragment
+	}
+
+	return next
+}
+
+func accessURL(r *http.Request, nextURL string, trustedProxies []*net.IPNet) string {
+	if nextURL == "" {
+		return ""
+	}
+	base := requestScheme(r, trustedProxies) + "://" + r.Host
+	if nextURL == "/" {
+		return base
+	}
+	return base + nextURL
+}
+
+func clientIP(r *http.Request, trustedProxies []*net.IPNet) string {
+	host := remoteAddrHost(r.RemoteAddr)
 
 	// Only trust forwarded headers when the immediate peer is a trusted proxy.
 	if isTrustedProxy(host, trustedProxies) {
-		if ip := r.Header.Get("X-Real-IP"); ip != "" {
-			return ip
+		if ip := parseIPToken(r.Header.Get("X-Real-IP")); ip != nil {
+			return ip.String()
 		}
 		if ff := r.Header.Get("X-Forwarded-For"); ff != "" {
-			return strings.TrimSpace(strings.SplitN(ff, ",", 2)[0])
+			parts := strings.Split(ff, ",")
+			fallback := ""
+			for i := len(parts) - 1; i >= 0; i-- {
+				ip := parseIPToken(parts[i])
+				if ip == nil {
+					continue
+				}
+				ipStr := ip.String()
+				fallback = ipStr
+				if !isTrustedProxy(ipStr, trustedProxies) {
+					return ipStr
+				}
+			}
+			if fallback != "" {
+				return fallback
+			}
 		}
 	}
 	return host
@@ -916,11 +1018,12 @@ func main() {
 
 	// Login page handlers
 	mux.HandleFunc("/totp-gate/login", func(w http.ResponseWriter, r *http.Request) {
-		nextURL := r.URL.Query().Get("next")
+		nextURL := sanitizeNextURL(r.URL.Query().Get("next"))
+		displayURL := accessURL(r, nextURL, cfg.trustedProxies)
 		switch r.Method {
 		case http.MethodGet:
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			if _, err := w.Write(renderLoginPage(cfg.totpDigits, "", nextURL)); err != nil {
+			if _, err := w.Write(renderLoginPage(cfg.totpDigits, "", displayURL)); err != nil {
 				log.Printf("login page write error: %v", err)
 			}
 
@@ -933,7 +1036,7 @@ func main() {
 				logRequest(r, http.StatusTooManyRequests, "rate limited")
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
 				w.WriteHeader(http.StatusTooManyRequests)
-				if _, err := w.Write(renderLoginPage(cfg.totpDigits, "Too many attempts, try again later", nextURL)); err != nil {
+				if _, err := w.Write(renderLoginPage(cfg.totpDigits, "Too many attempts, try again later", displayURL)); err != nil {
 					log.Printf("rate limit page write error: %v", err)
 				}
 				return
@@ -942,7 +1045,7 @@ func main() {
 			if err := r.ParseForm(); err != nil {
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
 				w.WriteHeader(http.StatusBadRequest)
-				if _, err := w.Write(renderLoginPage(cfg.totpDigits, "Invalid request", nextURL)); err != nil {
+				if _, err := w.Write(renderLoginPage(cfg.totpDigits, "Invalid request", displayURL)); err != nil {
 					log.Printf("error page write error: %v", err)
 				}
 				return
@@ -966,7 +1069,7 @@ func main() {
 				logRequest(r, http.StatusUnauthorized, "login failure")
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
 				w.WriteHeader(http.StatusUnauthorized)
-				if _, err := w.Write(renderLoginPage(cfg.totpDigits, "Invalid code. Please try again.", nextURL)); err != nil {
+				if _, err := w.Write(renderLoginPage(cfg.totpDigits, "Invalid code. Please try again.", displayURL)); err != nil {
 					log.Printf("login failure page write error: %v", err)
 				}
 			}
@@ -982,14 +1085,11 @@ func main() {
 		if !cfg.authDisabled {
 			valid, needsRefresh, loginTime, _ := validateCookie(r, cfg.cookieKey, cfg.refreshInterval, cfg.cookieTTL)
 			if !valid {
-				scheme := "https"
-				if r.TLS == nil && r.Header.Get("X-Forwarded-Proto") == "" {
-					scheme = "http"
-				} else if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
-					scheme = proto
+				nextURL := sanitizeNextURL(r.URL.RequestURI())
+				if nextURL == "" {
+					nextURL = "/"
 				}
-				fullURL := scheme + "://" + r.Host + r.RequestURI
-				loginURL := "/totp-gate/login?next=" + url.QueryEscape(fullURL)
+				loginURL := "/totp-gate/login?next=" + url.QueryEscape(nextURL)
 				http.Redirect(w, r, loginURL, http.StatusSeeOther)
 				return
 			}
