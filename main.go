@@ -67,6 +67,7 @@ type config struct {
 	totpAlgo           string // "SHA1", "SHA256", "SHA512"
 	cookieTTL          int    // max session lifetime (seconds)
 	cookieSecure       bool   // secure flag on cookies
+	cookiePersistent   bool   // persistent sessions across restarts
 	refreshInterval    int    // max inactivity window (seconds)
 	authDisabled       bool
 	cookieKey          []byte // derived from totpSecret
@@ -108,6 +109,8 @@ func loadConfig() *config {
 	cookieSecureEnv := os.Getenv("TOTPGATE_AUTH_COOKIE_SECURE")
 	c.cookieSecure = !strings.EqualFold(cookieSecureEnv, "false")
 
+	c.cookiePersistent = strings.EqualFold(os.Getenv("TOTPGATE_AUTH_COOKIE_PERSISTENT"), "true")
+
 	// Parse trusted proxies: always include 127.0.0.1.
 	// If TOTPGATE_TRUSTED_PROXIES is not set, default to all private ranges.
 	// If set, use the specified values + 127.0.0.1.
@@ -144,19 +147,26 @@ func loadConfig() *config {
 		log.Fatalf("unsupported TOTPGATE_TOTP_ALGORITHM %q", c.totpAlgo)
 	}
 
-	// Derive cookie signing key from TOTP secret + random nonce.
-	// The nonce is generated fresh each startup, so all sessions are
-	// invalidated when the container restarts.
+	// Derive cookie signing key from TOTP secret + optional nonce.
+	// By default a random nonce is used, so all sessions are invalidated
+	// when the process restarts. Set TOTPGATE_AUTH_COOKIE_PERSISTENT=true
+	// to skip the nonce and keep sessions valid across restarts.
 	if len(c.totpSecret) > 0 {
-		nonce := make([]byte, 16)
-		if _, err := rand.Read(nonce); err != nil {
-			log.Fatalf("failed to generate random nonce: %v", err)
-		}
 		mac := hmac.New(sha256.New, c.totpSecret)
 		mac.Write([]byte("totpgate-cookie-key"))
-		mac.Write(nonce)
+		if !c.cookiePersistent {
+			nonce := make([]byte, 16)
+			if _, err := rand.Read(nonce); err != nil {
+				log.Fatalf("failed to generate random nonce: %v", err)
+			}
+			mac.Write(nonce)
+		}
 		c.cookieKey = mac.Sum(nil)
-		log.Printf("  cookie nonce generated (sessions reset on restart)")
+		if c.cookiePersistent {
+			log.Printf("  cookie key derived without nonce (persistent sessions)")
+		} else {
+			log.Printf("  cookie nonce generated (sessions reset on restart)")
+		}
 	}
 
 	return c
@@ -1072,6 +1082,7 @@ Environment Variables:
   TOTPGATE_TOTP_ALGORITHM          TOTP algorithm: SHA1, SHA256, SHA512 (default: SHA1)
   TOTPGATE_AUTH_COOKIE_TTL         Session max lifetime in seconds (default: 86400)
   TOTPGATE_AUTH_COOKIE_SECURE      Set cookie Secure flag (default: true)
+  TOTPGATE_AUTH_COOKIE_PERSISTENT  Keep sessions valid across restarts (default: false)
   TOTPGATE_AUTH_REFRESH_INTERVAL   Max inactivity window in seconds (default: 600)
   TOTPGATE_AUTH_DISABLED           Disable authentication (for testing)
   TOTPGATE_TRUSTED_PROXIES         Comma-separated list of trusted proxy IPs/CIDRs
@@ -1137,6 +1148,7 @@ func main() {
 	log.Printf("  auth_disabled:   %v", cfg.authDisabled)
 	log.Printf("  cookie_ttl:      %d", cfg.cookieTTL)
 	log.Printf("  cookie_secure:   %v", cfg.cookieSecure)
+	log.Printf("  cookie_persistent: %v", cfg.cookiePersistent)
 	log.Printf("  refresh_interval: %d (max inactivity window)", cfg.refreshInterval)
 
 	// Log trusted proxy networks (for debugging forwarded-header trust)
