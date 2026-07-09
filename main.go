@@ -692,57 +692,61 @@ const loginPageHTML = `<!DOCTYPE html>
   
   /* Dark theme (default) */
   :root {
-    --bg-color: #1a1a2e;
-    --card-bg: #16213e;
-    --card-border: #0f3460;
-    --text-color: #e0e0e0;
-    --heading-color: #e94560;
-    --label-color: #a0a0b8;
-    --input-bg: #1a1a2e;
-    --input-border: #0f3460;
-    --button-bg: #e94560;
-    --button-hover: #c73652;
-    --error-bg: rgba(233,69,96,0.15);
-    --error-border: #e94560;
-    --error-text: #e94560;
-    --access-url-bg: #0d1b2e;
-    --access-url-border: #1a3a5c;
-    --access-url-color: #a0a0b8;
-    --access-url-link: #7ab3e0;
-    --access-url-link-hover: #add4f5;
-    --card-shadow: 0 8px 32px rgba(0,0,0,0.4);
-    --widget-bg: rgba(22,33,62,0.9);
-    --widget-text: #e0e0e0;
+    --bg-color: #0d1117;
+    --bg-gradient: linear-gradient(180deg, #0d1117 0%, #161b22 100%);
+    --card-bg: #161b22;
+    --card-border: #30363d;
+    --text-color: #e6edf3;
+    --heading-color: #58a6ff;
+    --label-color: #8b949e;
+    --input-bg: #0d1117;
+    --input-border: #30363d;
+    --button-bg: #238636;
+    --button-hover: #2ea043;
+    --button-shadow: 0 4px 15px rgba(0, 0, 0, 0.4);
+    --error-bg: rgba(248, 81, 73, 0.15);
+    --error-border: #f85149;
+    --error-text: #f85149;
+    --access-url-bg: #0d1117;
+    --access-url-border: #30363d;
+    --access-url-color: #8b949e;
+    --access-url-link: #58a6ff;
+    --access-url-link-hover: #79c0ff;
+    --card-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+    --widget-bg: #161b22;
+    --widget-text: #e6edf3;
   }
   
   /* Light theme */
   body.light-theme {
-    --bg-color: #f5f7fa !important;
+    --bg-color: #fafafa !important;
+    --bg-gradient: linear-gradient(180deg, #f8f9fa 0%, #e9ecef 100%);
     --card-bg: #ffffff;
-    --card-border: #d0d7de;
-    --text-color: #24292f;
-    --heading-color: #cf222e;
-    --label-color: #57606a;
-    --input-bg: #ffffff;
-    --input-border: #d0d7de;
-    --button-bg: #2da44e;
-    --button-hover: #2c974b;
-    --error-bg: rgba(207,34,46,0.1);
-    --error-border: #cf222e;
-    --error-text: #cf222e;
-    --access-url-bg: #f6f8fa;
-    --access-url-border: #d0d7de;
-    --access-url-color: #57606a;
-    --access-url-link: #0969da;
-    --access-url-link-hover: #0550ae;
-    --card-shadow: 0 8px 32px rgba(0,0,0,0.1);
-    --widget-bg: rgba(255,255,255,0.9);
-    --widget-text: #24292f;
+    --card-border: #dee2e6;
+    --text-color: #1a1a1a;
+    --heading-color: #2196f3;
+    --label-color: #6c757d;
+    --input-bg: #f8f9fa;
+    --input-border: #dee2e6;
+    --button-bg: #2196f3;
+    --button-hover: #1976d2;
+    --error-bg: #f8d7da;
+    --error-border: #dc3545;
+    --error-text: #dc3545;
+    --access-url-bg: #f8f9fa;
+    --access-url-border: #dee2e6;
+    --access-url-color: #6c757d;
+    --access-url-link: #2196f3;
+    --access-url-link-hover: #1976d2;
+    --card-shadow: 0 8px 32px rgba(0, 0, 0, 0.04);
+    --widget-bg: #ffffff;
+    --widget-text: #1a1a1a;
   }
   
   body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    background: var(--bg-color);
+    background: var(--bg-gradient);
+    background-attachment: fixed;
     color: var(--text-color);
     display: flex;
     align-items: center;
@@ -750,6 +754,8 @@ const loginPageHTML = `<!DOCTYPE html>
     min-height: 100vh;
     padding: 1rem;
     transition: background 0.3s ease, color 0.3s ease;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
   .card {
     background: var(--card-bg);
@@ -800,7 +806,7 @@ const loginPageHTML = `<!DOCTYPE html>
     transition: border-color 0.2s;
   }
   input[type="text"]:focus {
-    border-color: var(--button-bg);
+    border-color: #00b4d8;
   }
   button {
     width: 100%;
@@ -813,9 +819,10 @@ const loginPageHTML = `<!DOCTYPE html>
     font-size: 1rem;
     font-weight: 600;
     cursor: pointer;
-    transition: background 0.2s;
+    transition: all 0.2s ease;
+    box-shadow: var(--button-shadow, 0 4px 15px rgba(0,0,0,0.3));
   }
-  button:hover { background: var(--button-hover); }
+  button:hover { background: var(--button-hover); box-shadow: 0 6px 20px rgba(0, 180, 216, 0.5); }
   .access-url {
     text-align: center;
     font-size: 1rem;
@@ -852,8 +859,19 @@ const loginPageHTML = `<!DOCTYPE html>
     align-items: center;
     gap: 0.4rem;
     backdrop-filter: blur(10px);
-    transition: background 0.3s ease, border-color 0.3s ease, color 0.3s ease;
+    transition: background 0.3s ease, border-color 0.3s ease, color 0.3s ease, transform 0.2s ease;
     white-space: nowrap;
+  }
+  .time-widget .theme-badge {
+    cursor: pointer;
+    user-select: none;
+  }
+  .time-widget .theme-badge:hover {
+    transform: scale(1.05);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.25);
+  }
+  .time-widget .theme-badge:active {
+    transform: scale(0.95);
   }
   .time-widget .theme-label {
     font-weight: 500;
@@ -879,8 +897,8 @@ const loginPageHTML = `<!DOCTYPE html>
 
 <!-- Time widget showing local time and theme status -->
 <div class="time-widget">
-  <div class="widget-badge">
-    <span id="theme-icon">🌙</span>
+  <div class="widget-badge theme-badge" id="theme-toggle" title="Click to toggle theme">
+    <span id="theme-icon"></span>
     <span class="theme-label" id="theme-label">Dark</span>
   </div>
   <div class="widget-badge">
@@ -890,23 +908,65 @@ const loginPageHTML = `<!DOCTYPE html>
 </div>
 
 <script>
-  // Auto theme switching based on local time
-  // Light theme: 08:00 - 20:00, Dark theme: 20:00 - 08:00
-  function applyTheme() {
+  // Theme management with manual override and localStorage persistence
+  const STORAGE_KEY = 'totp-gate-theme-preference';
+  
+  function getPreferredTheme() {
+    return localStorage.getItem(STORAGE_KEY) || 'auto';
+  }
+  
+  function setPreferredTheme(theme) {
+    localStorage.setItem(STORAGE_KEY, theme);
+  }
+  
+  function getAutoTheme() {
     const now = new Date();
     const hour = now.getHours();
-    const isLightTheme = hour >= 8 && hour < 20;
+    return (hour >= 8 && hour < 20) ? 'light' : 'dark';
+  }
+  
+  function applyTheme(preferred) {
+    const theme = preferred === 'auto' ? getAutoTheme() : preferred;
+    const isLight = theme === 'light';
     
-    if (isLightTheme) {
+    if (isLight) {
       document.body.classList.add('light-theme');
+    } else {
+      document.body.classList.remove('light-theme');
+    }
+    
+    if (preferred === 'auto') {
+      document.getElementById('theme-icon').textContent = '🔄';
+      document.getElementById('theme-label').textContent = 'Auto';
+    } else if (preferred === 'light') {
       document.getElementById('theme-icon').textContent = '☀️';
       document.getElementById('theme-label').textContent = 'Light';
     } else {
-      document.body.classList.remove('light-theme');
-      document.getElementById('theme-icon').textContent = '🌙';
+      document.getElementById('theme-icon').textContent = '🌊';
       document.getElementById('theme-label').textContent = 'Dark';
     }
   }
+  
+  function toggleTheme() {
+    const current = getPreferredTheme();
+    let newTheme;
+    if (current === 'auto') {
+      newTheme = 'light';
+    } else if (current === 'light') {
+      newTheme = 'dark';
+    } else {
+      newTheme = 'auto';
+    }
+    setPreferredTheme(newTheme);
+    applyTheme(newTheme);
+  }
+  
+  // Initialize theme
+  const savedTheme = getPreferredTheme();
+  applyTheme(savedTheme);
+  
+  // Add click handler to theme badge
+  document.getElementById('theme-toggle').addEventListener('click', toggleTheme);
   
   // Update time display
   function updateTime() {
@@ -921,20 +981,19 @@ const loginPageHTML = `<!DOCTYPE html>
   }
   
   // Initialize and update every second
-  applyTheme();
+  applyTheme('auto');
   updateTime();
+  // Update time and check for auto theme changes
   setInterval(() => {
     updateTime();
-    // Re-check theme every minute in case hour changes
-    if (new Date().getSeconds() === 0) {
-      applyTheme();
+    // Re-check theme every minute if in auto mode
+    if (new Date().getSeconds() === 0 && getPreferredTheme() === 'auto') {
+      applyTheme('auto');
     }
   }, 1000);
 </script>
 </body>
 </html>`
-
-
 
 type loginPageData struct {
 	Digits    int
