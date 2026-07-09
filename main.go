@@ -838,7 +838,22 @@ const loginPageHTML = `<!DOCTYPE html>
   .access-url a { color: var(--access-url-link); text-decoration: underline; }
   .access-url a:hover { color: var(--access-url-link-hover); }
   
-  /* Time widget in bottom-right corner */
+  /* Version badge in bottom-left corner */
+  .version-badge {
+    position: fixed;
+    bottom: 1rem;
+    left: 1rem;
+    background: var(--widget-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 20px;
+    padding: 0.3rem 0.75rem;
+    font-size: 0.8rem;
+    color: var(--widget-text);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+    backdrop-filter: blur(10px);
+    transition: background 0.3s ease, border-color 0.3s ease, color 0.3s ease;
+    white-space: nowrap;
+  }
   .time-widget {
     position: fixed;
     bottom: 1rem;
@@ -894,6 +909,9 @@ const loginPageHTML = `<!DOCTYPE html>
     <button type="submit">Sign In</button>
   </form>
 </div>
+
+<!-- Version badge in bottom-left corner -->
+<div class="version-badge">{{.Version}}</div>
 
 <!-- Time widget showing local time and theme status -->
 <div class="time-widget">
@@ -999,6 +1017,7 @@ type loginPageData struct {
 	Digits    int
 	Error     string
 	AccessURL string
+	Version   string
 }
 
 var loginPageTemplate = template.Must(template.New("login-page").Parse(loginPageHTML))
@@ -1019,6 +1038,7 @@ func renderLoginPage(digits int, errMsg string, accessURL string) []byte {
 		Digits:    digits,
 		Error:     errMsg,
 		AccessURL: displayURL,
+		Version:   Version,
 	}); err != nil {
 		log.Printf("login page render error: %v", err)
 		return []byte("internal server error")
