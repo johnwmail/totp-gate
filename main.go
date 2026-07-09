@@ -689,24 +689,77 @@ const loginPageHTML = `<!DOCTYPE html>
 <title>TOTP Gate Login</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  
+  /* Dark theme (default) */
+  :root {
+    --bg-color: #1a1a2e;
+    --card-bg: #16213e;
+    --card-border: #0f3460;
+    --text-color: #e0e0e0;
+    --heading-color: #e94560;
+    --label-color: #a0a0b8;
+    --input-bg: #1a1a2e;
+    --input-border: #0f3460;
+    --button-bg: #e94560;
+    --button-hover: #c73652;
+    --error-bg: rgba(233,69,96,0.15);
+    --error-border: #e94560;
+    --error-text: #e94560;
+    --access-url-bg: #0d1b2e;
+    --access-url-border: #1a3a5c;
+    --access-url-color: #a0a0b8;
+    --access-url-link: #7ab3e0;
+    --access-url-link-hover: #add4f5;
+    --card-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    --widget-bg: rgba(22,33,62,0.9);
+    --widget-text: #e0e0e0;
+  }
+  
+  /* Light theme */
+  body.light-theme {
+    --bg-color: #f5f7fa !important;
+    --card-bg: #ffffff;
+    --card-border: #d0d7de;
+    --text-color: #24292f;
+    --heading-color: #cf222e;
+    --label-color: #57606a;
+    --input-bg: #ffffff;
+    --input-border: #d0d7de;
+    --button-bg: #2da44e;
+    --button-hover: #2c974b;
+    --error-bg: rgba(207,34,46,0.1);
+    --error-border: #cf222e;
+    --error-text: #cf222e;
+    --access-url-bg: #f6f8fa;
+    --access-url-border: #d0d7de;
+    --access-url-color: #57606a;
+    --access-url-link: #0969da;
+    --access-url-link-hover: #0550ae;
+    --card-shadow: 0 8px 32px rgba(0,0,0,0.1);
+    --widget-bg: rgba(255,255,255,0.9);
+    --widget-text: #24292f;
+  }
+  
   body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    background: #1a1a2e;
-    color: #e0e0e0;
+    background: var(--bg-color);
+    color: var(--text-color);
     display: flex;
     align-items: center;
     justify-content: center;
     min-height: 100vh;
     padding: 1rem;
+    transition: background 0.3s ease, color 0.3s ease;
   }
   .card {
-    background: #16213e;
-    border: 1px solid #0f3460;
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
     border-radius: 12px;
     padding: 2.5rem 2rem;
     width: 100%;
     max-width: 380px;
-    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    box-shadow: var(--card-shadow);
+    transition: background 0.3s ease, border-color 0.3s ease, box-shadow 0.3s ease;
   }
   @media (max-width: 420px) {
     .card { padding: 2rem 1.25rem; border-radius: 8px; }
@@ -715,12 +768,12 @@ const loginPageHTML = `<!DOCTYPE html>
     text-align: center;
     font-size: 1.5rem;
     margin-bottom: 0.5rem;
-    color: #e94560;
+    color: var(--heading-color);
   }
   .error {
-    background: rgba(233,69,96,0.15);
-    border: 1px solid #e94560;
-    color: #e94560;
+    background: var(--error-bg);
+    border: 1px solid var(--error-border);
+    color: var(--error-text);
     padding: 0.6rem 1rem;
     border-radius: 6px;
     margin-bottom: 1rem;
@@ -731,15 +784,15 @@ const loginPageHTML = `<!DOCTYPE html>
     display: block;
     margin-bottom: 0.4rem;
     font-size: 0.9rem;
-    color: #a0a0b8;
+    color: var(--label-color);
   }
   input[type="text"] {
     width: 100%;
     padding: 0.75rem 1rem;
-    border: 1px solid #0f3460;
+    border: 1px solid var(--input-border);
     border-radius: 6px;
-    background: #1a1a2e;
-    color: #e0e0e0;
+    background: var(--input-bg);
+    color: var(--text-color);
     font-size: 1.25rem;
     letter-spacing: 0.5em;
     text-align: center;
@@ -747,7 +800,7 @@ const loginPageHTML = `<!DOCTYPE html>
     transition: border-color 0.2s;
   }
   input[type="text"]:focus {
-    border-color: #e94560;
+    border-color: var(--button-bg);
   }
   button {
     width: 100%;
@@ -755,28 +808,61 @@ const loginPageHTML = `<!DOCTYPE html>
     padding: 0.75rem;
     border: none;
     border-radius: 6px;
-    background: #e94560;
+    background: var(--button-bg);
     color: #fff;
     font-size: 1rem;
     font-weight: 600;
     cursor: pointer;
     transition: background 0.2s;
   }
-  button:hover { background: #c73652; }
+  button:hover { background: var(--button-hover); }
   .access-url {
     text-align: center;
     font-size: 1rem;
-    color: #a0a0b8;
+    color: var(--access-url-color);
     margin-top: 0;
     margin-bottom: 1.25rem;
     word-break: break-all;
     padding: 0.5rem 0.75rem;
-    background: #0d1b2e;
-    border: 1px solid #1a3a5c;
+    background: var(--access-url-bg);
+    border: 1px solid var(--access-url-border);
     border-radius: 6px;
   }
-  .access-url a { color: #7ab3e0; text-decoration: underline; }
-  .access-url a:hover { color: #add4f5; }
+  .access-url a { color: var(--access-url-link); text-decoration: underline; }
+  .access-url a:hover { color: var(--access-url-link-hover); }
+  
+  /* Time widget in bottom-right corner */
+  .time-widget {
+    position: fixed;
+    bottom: 1rem;
+    right: 1rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .time-widget .widget-badge {
+    background: var(--widget-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 20px;
+    padding: 0.3rem 0.75rem;
+    font-size: 0.8rem;
+    color: var(--widget-text);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    backdrop-filter: blur(10px);
+    transition: background 0.3s ease, border-color 0.3s ease, color 0.3s ease;
+    white-space: nowrap;
+  }
+  .time-widget .theme-label {
+    font-weight: 500;
+  }
+  .time-widget .time-display {
+    font-family: 'Courier New', monospace;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+  }
 </style>
 </head>
 <body>
@@ -790,8 +876,65 @@ const loginPageHTML = `<!DOCTYPE html>
     <button type="submit">Sign In</button>
   </form>
 </div>
+
+<!-- Time widget showing local time and theme status -->
+<div class="time-widget">
+  <div class="widget-badge">
+    <span id="theme-icon">🌙</span>
+    <span class="theme-label" id="theme-label">Dark</span>
+  </div>
+  <div class="widget-badge">
+    <span>🕐</span>
+    <span class="time-display" id="time-display">--:--:--</span>
+  </div>
+</div>
+
+<script>
+  // Auto theme switching based on local time
+  // Light theme: 08:00 - 20:00, Dark theme: 20:00 - 08:00
+  function applyTheme() {
+    const now = new Date();
+    const hour = now.getHours();
+    const isLightTheme = hour >= 8 && hour < 20;
+    
+    if (isLightTheme) {
+      document.body.classList.add('light-theme');
+      document.getElementById('theme-icon').textContent = '☀️';
+      document.getElementById('theme-label').textContent = 'Light';
+    } else {
+      document.body.classList.remove('light-theme');
+      document.getElementById('theme-icon').textContent = '🌙';
+      document.getElementById('theme-label').textContent = 'Dark';
+    }
+  }
+  
+  // Update time display
+  function updateTime() {
+    const now = new Date();
+    const timeStr = now.toLocaleTimeString('en-US', { 
+      hour12: false,
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    });
+    document.getElementById('time-display').textContent = timeStr;
+  }
+  
+  // Initialize and update every second
+  applyTheme();
+  updateTime();
+  setInterval(() => {
+    updateTime();
+    // Re-check theme every minute in case hour changes
+    if (new Date().getSeconds() === 0) {
+      applyTheme();
+    }
+  }, 1000);
+</script>
 </body>
 </html>`
+
+
 
 type loginPageData struct {
 	Digits    int
