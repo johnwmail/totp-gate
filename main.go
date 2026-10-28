@@ -10,6 +10,7 @@ import (
 	"crypto/sha512"
 	"crypto/tls"
 	"encoding/base32"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -72,7 +73,8 @@ type config struct {
 	authDisabled       bool
 	cookieKey          []byte // derived from totpSecret
 	trustedProxies     []*net.IPNet
-	insecureSkipVerify bool // skip upstream TLS cert verification
+	insecureSkipVerify bool   // skip upstream TLS cert verification
+	upstreamAuthz      string // Authorization header injected into upstream requests (empty = disabled)
 }
 
 func loadConfig() *config {
@@ -104,6 +106,11 @@ func loadConfig() *config {
 	c.authDisabled = strings.EqualFold(os.Getenv("TOTPGATE_AUTH_DISABLED"), "true")
 
 	c.insecureSkipVerify = strings.EqualFold(os.Getenv("TOTPGATE_INSECURE_SKIP_VERIFY"), "true")
+
+	// Optional credentials injected into upstream requests, so the upstream
+	// service can require its own auth without prompting the browser after the
+	// TOTP login.
+	c.upstreamAuthz = upstreamAuthorization()
 
 	// Allow configuring cookie Secure flag (default true for HTTPS deployments)
 	cookieSecureEnv := os.Getenv("TOTPGATE_AUTH_COOKIE_SECURE")
@@ -209,6 +216,23 @@ func loadTOTPSecret() (string, error) {
 	}
 
 	return "", fmt.Errorf("TOTP secret not found: set TOTPGATE_TOTP_SECRET or mount %s", secretFile)
+}
+
+// upstreamAuthorization returns the value of the Authorization header injected
+// into every upstream request. TOTPGATE_UPSTREAM_AUTHORIZATION is used verbatim
+// when set; otherwise TOTPGATE_UPSTREAM_AUTH_PASSWORD (with an optional
+// TOTPGATE_UPSTREAM_AUTH_USER, default "opencode") is combined into a Basic
+// credential. An empty return value disables header injection.
+func upstreamAuthorization() string {
+	if v := strings.TrimSpace(os.Getenv("TOTPGATE_UPSTREAM_AUTHORIZATION")); v != "" {
+		return v
+	}
+	password := os.Getenv("TOTPGATE_UPSTREAM_AUTH_PASSWORD")
+	if password == "" {
+		return ""
+	}
+	user := envOrDefault("TOTPGATE_UPSTREAM_AUTH_USER", "opencode")
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+password))
 }
 
 func envOrDefaultInt(key string, def int) int {
@@ -1292,6 +1316,9 @@ Options:
 Environment Variables:
   TOTPGATE_AUTH_LISTEN              Listen address, port or ip:port (default: 0.0.0.0:8080)
   TOTPGATE_UPSTREAM                Upstream URL (default: http://localhost:3000)
+  TOTPGATE_UPSTREAM_AUTH_USER      Username for injected Basic auth (default: opencode)
+  TOTPGATE_UPSTREAM_AUTH_PASSWORD  Password for injected Basic auth (default: disabled)
+  TOTPGATE_UPSTREAM_AUTHORIZATION  Authorization header value to inject (overrides user/password)
   TOTPGATE_TARGETS                 Multi-target mode: host=url,host/path-prefix=url,default=url
                                    Keys: "host", "host/path-prefix", or "default" (catchall fallback).
                                    More specific (longer) rules take precedence.
@@ -1330,6 +1357,42 @@ Examples:
   TOTPGATE_TARGETS="app.example.com/api=http://api:8080,default=http://fallback:3000" totp-gate
 
 Version: ` + Version + `, Commit: ` + Commit + `, Built: ` + BuildTime)
+}
+
+// newProxy builds the reverse proxy used for authenticated requests. When
+// upstream credentials are configured they are set on every proxied request
+// (including WebSocket upgrades), so the browser never sees the upstream's own
+// auth prompt.
+func newProxy(cfg *config) *httputil.ReverseProxy {
+	return &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.Out.Header.Set("X-Real-IP", clientIP(r.In, cfg.trustedProxies))
+
+			// Resolve the target upstream for this request.
+			target := resolveTarget(cfg, r.In)
+			r.SetURL(target)
+
+			// Preserve original Host header for upstream
+			r.Out.Host = r.In.Host
+			r.Out.Header.Set("Host", r.In.Host)
+
+			// Replace (never append to) any client-supplied Authorization
+			// header so callers cannot choose the upstream credentials.
+			if cfg.upstreamAuthz != "" {
+				r.Out.Header.Set("Authorization", cfg.upstreamAuthz)
+			}
+		},
+		ModifyResponse: logProxyResponse,
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			logProxyError(r, cfg, err)
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+		},
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: cfg.insecureSkipVerify, // nolint:gosec
+			},
+		},
+	}
 }
 
 func main() {
@@ -1380,34 +1443,13 @@ func main() {
 	}
 	log.Printf("  trusted_proxies:   %s", strings.Join(trustedStrs, ", "))
 	log.Printf("  insecure_skip_verify: %v", cfg.insecureSkipVerify)
+	log.Printf("  upstream_auth:        %v", cfg.upstreamAuthz != "")
 
 	// Rate limiter: 5 attempts per IP per minute
 	rl := newRateLimiter(5, 1*time.Minute)
 
 	// Reverse proxy with dynamic host/path-prefix routing
-	proxy := &httputil.ReverseProxy{
-		Rewrite: func(r *httputil.ProxyRequest) {
-			r.Out.Header.Set("X-Real-IP", clientIP(r.In, cfg.trustedProxies))
-
-			// Resolve the target upstream for this request.
-			target := resolveTarget(cfg, r.In)
-			r.SetURL(target)
-
-			// Preserve original Host header for upstream
-			r.Out.Host = r.In.Host
-			r.Out.Header.Set("Host", r.In.Host)
-		},
-		ModifyResponse: logProxyResponse,
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			logProxyError(r, cfg, err)
-			http.Error(w, "bad gateway", http.StatusBadGateway)
-		},
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: cfg.insecureSkipVerify, // nolint:gosec
-			},
-		},
-	}
+	proxy := newProxy(cfg)
 
 	mux := http.NewServeMux()
 

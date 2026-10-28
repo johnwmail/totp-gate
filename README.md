@@ -49,6 +49,9 @@ All configuration is done via environment variables:
 | `TOTPGATE_AUTH_LISTEN` | `0.0.0.0:8080` | Address to listen on (port or ip:port) |
 | `TOTPGATE_UPSTREAM` | `http://localhost:3000` | Upstream service URL to proxy to |
 | `TOTPGATE_TARGETS` | *(empty)* | Multi-target routing: `host=upstream,host/path-prefix=upstream,default=upstream`. Overrides `TOTPGATE_UPSTREAM`. |
+| `TOTPGATE_UPSTREAM_AUTH_USER` | `opencode` | Username for the Basic credential injected into upstream requests |
+| `TOTPGATE_UPSTREAM_AUTH_PASSWORD` | *(empty)* | Password for the injected Basic credential (empty = injection disabled) |
+| `TOTPGATE_UPSTREAM_AUTHORIZATION` | *(empty)* | Literal `Authorization` header value to inject; overrides user/password |
 | `TOTPGATE_AUTH_DISABLED` | `false` | Disable authentication (bypass mode) |
 | `TOTPGATE_TOTP_SECRET` | *(required)* | Base32-encoded TOTP secret (fallback) |
 | `TOTPGATE_TOTP_SECRET_FILE` | `/run/secrets/totpgate_totp_secret` | Path to file containing TOTP secret |
@@ -90,6 +93,24 @@ TOTPGATE_INSECURE_SKIP_VERIFY=true
 ```
 
 ⚠️ **Warning**: Only use this in development or trusted networks. In production, mount your CA certificate into the container and ensure the system trust store includes it.
+
+### Upstream Authentication
+
+Some upstream services require their own credentials. Instead of letting the browser hit the upstream's auth prompt, totp-gate can inject an `Authorization` header into every proxied request:
+
+```bash
+TOTPGATE_UPSTREAM_AUTH_USER=opencode \
+TOTPGATE_UPSTREAM_AUTH_PASSWORD=secret \
+  totp-gate
+```
+
+Every upstream request then carries `Authorization: Basic base64(user:password)`. A client-supplied `Authorization` header is replaced, not forwarded. For upstreams that use another scheme, set the header value directly:
+
+```bash
+TOTPGATE_UPSTREAM_AUTHORIZATION="Bearer eyJhbGciOi..." totp-gate
+```
+
+The injected header also applies to WebSocket upgrades. TOTP becomes the only interactive login, so keep the upstream bound to a private interface and never expose it directly.
 
 ### Multi-Target Routing
 

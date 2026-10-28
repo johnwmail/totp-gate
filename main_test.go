@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base32"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -1136,5 +1137,99 @@ func TestProxyWebSocketRouting(t *testing.T) {
 				t.Errorf("expected body %q, got %q", tt.expected, rr.Body.String())
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Upstream Authorization Injection Tests
+// ---------------------------------------------------------------------------
+
+func TestUpstreamAuthorization(t *testing.T) {
+	basic := func(user, pass string) string {
+		return "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass))
+	}
+
+	envKeys := []string{
+		"TOTPGATE_UPSTREAM_AUTH_USER",
+		"TOTPGATE_UPSTREAM_AUTH_PASSWORD",
+		"TOTPGATE_UPSTREAM_AUTHORIZATION",
+	}
+
+	tests := []struct {
+		name     string
+		env      map[string]string
+		expected string
+	}{
+		{"disabled when nothing is set", map[string]string{}, ""},
+		{"password only uses default user", map[string]string{
+			"TOTPGATE_UPSTREAM_AUTH_PASSWORD": "OPENCODEv2",
+		}, basic("opencode", "OPENCODEv2")},
+		{"custom user", map[string]string{
+			"TOTPGATE_UPSTREAM_AUTH_USER":     "alice",
+			"TOTPGATE_UPSTREAM_AUTH_PASSWORD": "s3cret",
+		}, basic("alice", "s3cret")},
+		{"explicit authorization wins", map[string]string{
+			"TOTPGATE_UPSTREAM_AUTHORIZATION": "Bearer token123",
+			"TOTPGATE_UPSTREAM_AUTH_PASSWORD": "s3cret",
+		}, "Bearer token123"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, k := range envKeys {
+				t.Setenv(k, "")
+			}
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+			if got := upstreamAuthorization(); got != tt.expected {
+				t.Errorf("upstreamAuthorization() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestProxyInjectsUpstreamAuthorization(t *testing.T) {
+	var gotAuth string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer backend.Close()
+
+	u, _ := url.Parse(backend.URL)
+	cfg := &config{upstreamURL: u}
+	cfg.upstreamAuthz = "Basic " + base64.StdEncoding.EncodeToString([]byte("opencode:OPENCODEv2"))
+
+	req := httptest.NewRequest("GET", "/", nil)
+	// A client-supplied header must be replaced, not forwarded alongside ours.
+	req.Header.Set("Authorization", "Basic YXR0YWNrZXI6YXR0YWNrZXI=")
+	rr := httptest.NewRecorder()
+	newProxy(cfg).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rr.Code)
+	}
+	if gotAuth != cfg.upstreamAuthz {
+		t.Errorf("upstream Authorization = %q, want %q", gotAuth, cfg.upstreamAuthz)
+	}
+}
+
+func TestProxyWithoutUpstreamAuthorization(t *testing.T) {
+	var gotAuth string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+	}))
+	defer backend.Close()
+
+	u, _ := url.Parse(backend.URL)
+	cfg := &config{upstreamURL: u}
+
+	req := httptest.NewRequest("GET", "/", nil)
+	rr := httptest.NewRecorder()
+	newProxy(cfg).ServeHTTP(rr, req)
+
+	if gotAuth != "" {
+		t.Errorf("expected no Authorization header, got %q", gotAuth)
 	}
 }
