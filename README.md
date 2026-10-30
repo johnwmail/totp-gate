@@ -204,6 +204,14 @@ Client → totp-gate (:8080) ──Host: app.example.com/api──→ API Servic
 - **Inactivity Window**: Sessions expire after `TOTPGATE_AUTH_REFRESH_INTERVAL` without any authenticated request
 - **Security**: Cookies are HMAC-signed with a key derived from the TOTP secret + random nonce (regenerated on each restart, invalidating all sessions)
 
+When a session is missing or expired, document navigations (`Sec-Fetch-Mode: navigate`)
+are redirected to the login page with a `next` parameter. API, XHR, EventSource and
+service-worker requests receive `401 Unauthorized` with a JSON body and an
+`X-TOTP-Gate-Login` header instead. Redirecting those requests would hand the login
+page HTML to a client expecting JSON/SSE, leaving single-page apps retrying forever.
+The 401 deliberately omits `WWW-Authenticate` so browsers do not show a native
+credentials prompt for the upstream service.
+
 ## Endpoints
 
 | Path | Description |

@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -552,23 +553,179 @@ func TestClientIP(t *testing.T) {
 
 func TestLoginPageRendering(t *testing.T) {
 	// Without error
-	html := string(renderLoginPage(6, "", ""))
+	html := string(renderLoginPage(6, "", "", ""))
 	if len(html) == 0 {
 		t.Error("login page should not be empty")
 	}
 
 	// With error message
-	html = string(renderLoginPage(6, "Invalid code", ""))
+	html = string(renderLoginPage(6, "Invalid code", "", ""))
 	if len(html) == 0 {
 		t.Error("login page with error should not be empty")
 	}
 
-	escaped := string(renderLoginPage(6, "", `https://example.com/"><script>alert(1)</script>`))
+	escaped := string(renderLoginPage(6, "", `https://example.com/"><script>alert(1)</script>`, ""))
 	if strings.Contains(escaped, `<script>alert(1)</script>`) {
 		t.Error("login page should escape access URL content")
 	}
 	if !strings.Contains(escaped, "&lt;script&gt;alert(1)&lt;/script&gt;") {
 		t.Error("escaped access URL should still be visible to the user")
+	}
+}
+
+func TestLoginPageKeepsNextOnFormAction(t *testing.T) {
+	page := string(renderLoginPage(6, "", "", "/session/abc?tab=1&x=2"))
+	want := `action="/totp-gate/login?next=%2Fsession%2Fabc%3Ftab%3D1%26x%3D2"`
+	if !strings.Contains(page, want) {
+		t.Errorf("login form action should carry next; want %s in page", want)
+	}
+
+	if strings.Contains(string(renderLoginPage(6, "", "", "")), "?next=") {
+		t.Error("login form action should not carry an empty next")
+	}
+}
+
+func TestIsNavigationRequest(t *testing.T) {
+	tests := []struct {
+		name   string
+		mode   string
+		accept string
+		want   bool
+	}{
+		{"document navigation", "navigate", "text/html,application/xhtml+xml", true},
+		{"fetch same-origin", "same-origin", "*/*", false},
+		{"fetch with html accept", "cors", "text/html", false},
+		{"event source", "cors", "text/event-stream", false},
+		{"service worker", "same-origin", "*/*", false},
+		{"no sec-fetch header browser", "", "text/html,application/xhtml+xml", true},
+		{"no sec-fetch header api client", "", "*/*", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/", nil)
+			if tt.mode != "" {
+				req.Header.Set("Sec-Fetch-Mode", tt.mode)
+			}
+			if tt.accept != "" {
+				req.Header.Set("Accept", tt.accept)
+			}
+			if got := isNavigationRequest(req); got != tt.want {
+				t.Errorf("isNavigationRequest() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWriteAuthRequired(t *testing.T) {
+	t.Run("navigation redirects", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/session/abc?tab=1", nil)
+		req.Header.Set("Sec-Fetch-Mode", "navigate")
+		rr := httptest.NewRecorder()
+		if got := writeAuthRequired(rr, req, "/session/abc?tab=1"); got != http.StatusSeeOther {
+			t.Fatalf("status = %d, want %d", got, http.StatusSeeOther)
+		}
+		loc := rr.Header().Get("Location")
+		if want := "/totp-gate/login?next=%2Fsession%2Fabc%3Ftab%3D1"; loc != want {
+			t.Errorf("Location = %q, want %q", loc, want)
+		}
+	})
+
+	t.Run("api gets 401 without challenge", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/info", nil)
+		req.Header.Set("Sec-Fetch-Mode", "cors")
+		req.Header.Set("Accept", "*/*")
+		rr := httptest.NewRecorder()
+		if got := writeAuthRequired(rr, req, "/api/info"); got != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want %d", got, http.StatusUnauthorized)
+		}
+		if got := rr.Code; got != http.StatusUnauthorized {
+			t.Errorf("recorder status = %d, want %d", got, http.StatusUnauthorized)
+		}
+		if got := rr.Header().Get("WWW-Authenticate"); got != "" {
+			t.Errorf("WWW-Authenticate must be empty (it would trigger a native prompt), got %q", got)
+		}
+		if got := rr.Header().Get("Location"); got != "" {
+			t.Errorf("API responses must not redirect, got Location %q", got)
+		}
+		if ct := rr.Header().Get("Content-Type"); ct != "application/json; charset=utf-8" {
+			t.Errorf("Content-Type = %q, want JSON", ct)
+		}
+		if body := rr.Body.String(); !strings.Contains(body, `"/totp-gate/login?next=%2Fapi%2Finfo"`) {
+			t.Errorf("body should advertise the login URL, got %s", body)
+		}
+	})
+
+	t.Run("empty next defaults to root", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.Header.Set("Sec-Fetch-Mode", "navigate")
+		rr := httptest.NewRecorder()
+		writeAuthRequired(rr, req, "")
+		if got, want := rr.Header().Get("Location"), "/totp-gate/login?next=%2F"; got != want {
+			t.Errorf("Location = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestIsStreamingRequest(t *testing.T) {
+	tests := []struct {
+		name    string
+		headers map[string]string
+		want    bool
+	}{
+		{"event stream", map[string]string{"Accept": "text/event-stream"}, true},
+		{"websocket", map[string]string{"Upgrade": "websocket", "Connection": "Upgrade"}, true},
+		{"json api", map[string]string{"Accept": "application/json"}, false},
+		{"document", map[string]string{"Accept": "text/html"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/", nil)
+			for k, v := range tt.headers {
+				req.Header.Set(k, v)
+			}
+			if got := isStreamingRequest(req); got != tt.want {
+				t.Errorf("isStreamingRequest() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestClearStreamingWriteDeadlineOutlivesWriteTimeout(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			clearStreamingWriteDeadline(w, r.URL.Path)
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			for i := 0; i < 5; i++ {
+				if _, err := fmt.Fprintf(w, "data: %d\n\n", i); err != nil {
+					return
+				}
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+		}),
+		// Shorter than the stream: the handler must clear this deadline.
+		WriteTimeout: 250 * time.Millisecond,
+	}
+	go func() { _ = srv.Serve(ln) }()
+	defer srv.Close()
+
+	resp, err := http.Get("http://" + ln.Addr().String() + "/api/event")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if got := strings.Count(string(body), "data:"); got != 5 {
+		t.Fatalf("expected the stream to survive WriteTimeout with 5 events, got %d: %q", got, body)
 	}
 }
 

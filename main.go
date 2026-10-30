@@ -498,7 +498,7 @@ func formatCookieAge(seconds int64) string {
 	return (time.Duration(seconds) * time.Second).String()
 }
 
-func logCookieRejection(r *http.Request, cfg *config, result cookieValidationResult) {
+func logCookieRejection(r *http.Request, cfg *config, result cookieValidationResult, status int) {
 	ip := clientIP(r, cfg.trustedProxies)
 	scheme := requestScheme(r, cfg.trustedProxies)
 
@@ -511,7 +511,79 @@ func logCookieRejection(r *http.Request, cfg *config, result cookieValidationRes
 	}
 
 	log.Printf("%s", msg)
-	logRequest(r, http.StatusSeeOther, "auth redirect: "+result.reason)
+	action := "auth redirect"
+	if status == http.StatusUnauthorized {
+		action = "auth required"
+	}
+	logRequest(r, status, action+": "+result.reason)
+}
+
+// isStreamingRequest reports whether the request asks for a long-lived
+// streaming response (Server-Sent Events) or a WebSocket upgrade. The
+// server-wide WriteTimeout would otherwise terminate those connections
+// 60 seconds after they start.
+func isStreamingRequest(r *http.Request) bool {
+	if strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/event-stream") {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(r.Header.Get("Upgrade")), "websocket")
+}
+
+// responseWriterContextKey carries the inbound ResponseWriter to ModifyResponse,
+// where the original writer is not otherwise available.
+type responseWriterContextKey struct{}
+
+// clearStreamingWriteDeadline disables the server-wide write timeout for a
+// response that can legitimately stay open indefinitely. Without this, SSE and
+// WebSocket connections are cut off by http.Server.WriteTimeout.
+func clearStreamingWriteDeadline(w http.ResponseWriter, path string) {
+	if w == nil {
+		return
+	}
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Time{}); err != nil {
+		log.Printf("failed to clear write deadline for %s: %v", path, err)
+	}
+}
+
+// isNavigationRequest reports whether the request is a top-level document
+// navigation rather than a fetch/XHR, EventSource, service-worker or asset
+// request. Only navigations may be answered with a redirect to the login page:
+// fetch/XHR and EventSource clients follow redirects transparently, so handing
+// them the login page HTML leaves single-page apps retrying forever instead of
+// telling the user to authenticate again.
+func isNavigationRequest(r *http.Request) bool {
+	if mode := strings.TrimSpace(r.Header.Get("Sec-Fetch-Mode")); mode != "" {
+		return strings.EqualFold(mode, "navigate")
+	}
+	// Fallback for clients that do not send Sec-Fetch-* headers.
+	return strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/html")
+}
+
+// writeAuthRequired writes the response for an unauthenticated request and
+// returns the HTTP status used. Navigations are redirected to the login page so
+// the browser displays it; other requests get a 401 without WWW-Authenticate,
+// so clients can detect the expired session without a native browser
+// credentials prompt (which would stall the app's fetch calls).
+func writeAuthRequired(w http.ResponseWriter, r *http.Request, nextURL string) int {
+	if nextURL == "" {
+		nextURL = "/"
+	}
+	loginURL := "/totp-gate/login?next=" + url.QueryEscape(nextURL)
+
+	if isNavigationRequest(r) {
+		http.Redirect(w, r, loginURL, http.StatusSeeOther)
+		return http.StatusSeeOther
+	}
+
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("X-TOTP-Gate-Login", loginURL)
+	w.WriteHeader(http.StatusUnauthorized)
+	body := `{"error":"authentication required","login":` + strconv.Quote(loginURL) + "}\n"
+	if _, err := w.Write([]byte(body)); err != nil {
+		log.Printf("auth failure write error: %v", err)
+	}
+	return http.StatusUnauthorized
 }
 
 // setCookie creates a session cookie with expiry and timestamps.
@@ -927,7 +999,7 @@ const loginPageHTML = `<!DOCTYPE html>
   <h1>TOTP Gate Login</h1>
   {{if .AccessURL}}<p class="access-url">{{.AccessURL}}</p>{{end}}
   {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
-  <form method="POST" action="/totp-gate/login" autocomplete="off">
+  <form method="POST" action="{{.FormAction}}" autocomplete="off">
     <label for="code">Authentication Code</label>
     <input type="text" id="code" name="code" maxlength="{{.Digits}}" pattern="[0-9]*" inputmode="numeric" autofocus required>
     <button type="submit">Sign In</button>
@@ -1038,15 +1110,16 @@ const loginPageHTML = `<!DOCTYPE html>
 </html>`
 
 type loginPageData struct {
-	Digits    int
-	Error     string
-	AccessURL string
-	Version   string
+	Digits     int
+	Error      string
+	AccessURL  string
+	Version    string
+	FormAction string
 }
 
 var loginPageTemplate = template.Must(template.New("login-page").Parse(loginPageHTML))
 
-func renderLoginPage(digits int, errMsg string, accessURL string) []byte {
+func renderLoginPage(digits int, errMsg string, accessURL string, nextURL string) []byte {
 	displayURL := accessURL
 	if accessURL != "" {
 		if parsed, err := url.Parse(accessURL); err == nil && (parsed.Path == "" || parsed.Path == "/") && parsed.RawQuery == "" {
@@ -1057,12 +1130,20 @@ func renderLoginPage(digits int, errMsg string, accessURL string) []byte {
 		displayURL = truncateURL(displayURL, 60)
 	}
 
+	// Keep `next` on the form action: the POST must carry it, otherwise the
+	// browser submits to the bare path and the login handler redirects to "/".
+	formAction := "/totp-gate/login"
+	if nextURL != "" {
+		formAction += "?next=" + url.QueryEscape(nextURL)
+	}
+
 	var buf bytes.Buffer
 	if err := loginPageTemplate.Execute(&buf, loginPageData{
-		Digits:    digits,
-		Error:     errMsg,
-		AccessURL: displayURL,
-		Version:   Version,
+		Digits:     digits,
+		Error:      errMsg,
+		AccessURL:  displayURL,
+		Version:    Version,
+		FormAction: formAction,
 	}); err != nil {
 		log.Printf("login page render error: %v", err)
 		return []byte("internal server error")
@@ -1382,7 +1463,22 @@ func newProxy(cfg *config) *httputil.ReverseProxy {
 				r.Out.Header.Set("Authorization", cfg.upstreamAuthz)
 			}
 		},
-		ModifyResponse: logProxyResponse,
+		ModifyResponse: func(resp *http.Response) error {
+			if err := logProxyResponse(resp); err != nil {
+				return err
+			}
+			// SSE responses and protocol switches can stay open indefinitely;
+			// clear the server write deadline so they are not cut at 60s.
+			if resp.StatusCode == http.StatusSwitchingProtocols ||
+				strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+				if resp.Request != nil {
+					if w, ok := resp.Request.Context().Value(responseWriterContextKey{}).(http.ResponseWriter); ok {
+						clearStreamingWriteDeadline(w, resp.Request.URL.Path)
+					}
+				}
+			}
+			return nil
+		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			logProxyError(r, cfg, err)
 			http.Error(w, "bad gateway", http.StatusBadGateway)
@@ -1471,7 +1567,7 @@ func main() {
 		case http.MethodGet:
 			logRequest(r, http.StatusOK, "login page served")
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			if _, err := w.Write(renderLoginPage(cfg.totpDigits, "", displayURL)); err != nil {
+			if _, err := w.Write(renderLoginPage(cfg.totpDigits, "", displayURL, nextURL)); err != nil {
 				log.Printf("login page write error: %v", err)
 			}
 
@@ -1482,7 +1578,7 @@ func main() {
 				logRequest(r, http.StatusTooManyRequests, "rate limited")
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
 				w.WriteHeader(http.StatusTooManyRequests)
-				if _, err := w.Write(renderLoginPage(cfg.totpDigits, "Too many attempts, try again later", displayURL)); err != nil {
+				if _, err := w.Write(renderLoginPage(cfg.totpDigits, "Too many attempts, try again later", displayURL, nextURL)); err != nil {
 					log.Printf("rate limit page write error: %v", err)
 				}
 				return
@@ -1493,7 +1589,7 @@ func main() {
 				logRequest(r, http.StatusBadRequest, "invalid login form")
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
 				w.WriteHeader(http.StatusBadRequest)
-				if _, err := w.Write(renderLoginPage(cfg.totpDigits, "Invalid request", displayURL)); err != nil {
+				if _, err := w.Write(renderLoginPage(cfg.totpDigits, "Invalid request", displayURL, nextURL)); err != nil {
 					log.Printf("error page write error: %v", err)
 				}
 				return
@@ -1517,7 +1613,7 @@ func main() {
 				logRequest(r, http.StatusUnauthorized, "login failure")
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
 				w.WriteHeader(http.StatusUnauthorized)
-				if _, err := w.Write(renderLoginPage(cfg.totpDigits, "Invalid code. Please try again.", displayURL)); err != nil {
+				if _, err := w.Write(renderLoginPage(cfg.totpDigits, "Invalid code. Please try again.", displayURL, nextURL)); err != nil {
 					log.Printf("login failure page write error: %v", err)
 				}
 			}
@@ -1534,13 +1630,9 @@ func main() {
 		if !cfg.authDisabled {
 			cookieResult := validateCookieWithReason(r, cfg.cookieKey, cfg.refreshInterval, cfg.cookieTTL)
 			if !cookieResult.valid {
-				logCookieRejection(r, cfg, cookieResult)
 				nextURL := sanitizeNextURL(r.URL.RequestURI())
-				if nextURL == "" {
-					nextURL = "/"
-				}
-				loginURL := "/totp-gate/login?next=" + url.QueryEscape(nextURL)
-				http.Redirect(w, r, loginURL, http.StatusSeeOther)
+				status := writeAuthRequired(w, r, nextURL)
+				logCookieRejection(r, cfg, cookieResult, status)
 				return
 			}
 			// Persist the latest activity timestamp for sliding inactivity enforcement.
@@ -1557,7 +1649,10 @@ func main() {
 			return
 		}
 		log.Printf("proxying request from IP %s to %s", clientIP(r, cfg.trustedProxies), targetForLog(resolveTarget(cfg, r)))
-		proxy.ServeHTTP(w, r)
+		if isStreamingRequest(r) {
+			clearStreamingWriteDeadline(w, r.URL.Path)
+		}
+		proxy.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), responseWriterContextKey{}, w)))
 	})
 
 	server := &http.Server{
