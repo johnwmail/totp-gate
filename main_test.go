@@ -715,13 +715,13 @@ func TestClearStreamingWriteDeadlineOutlivesWriteTimeout(t *testing.T) {
 		WriteTimeout: 250 * time.Millisecond,
 	}
 	go func() { _ = srv.Serve(ln) }()
-	defer srv.Close()
+	defer func() { _ = srv.Close() }()
 
 	resp, err := http.Get("http://" + ln.Addr().String() + "/api/event")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, _ := io.ReadAll(resp.Body)
 	if got := strings.Count(string(body), "data:"); got != 5 {
