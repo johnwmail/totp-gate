@@ -205,12 +205,18 @@ Client → totp-gate (:8080) ──Host: app.example.com/api──→ API Servic
 - **Security**: Cookies are HMAC-signed with a key derived from the TOTP secret + random nonce (regenerated on each restart, invalidating all sessions)
 
 When a session is missing or expired, document navigations (`Sec-Fetch-Mode: navigate`)
-are redirected to the login page with a `next` parameter. API, XHR, EventSource and
-service-worker requests receive `401 Unauthorized` with a JSON body and an
-`X-TOTP-Gate-Login` header instead. Redirecting those requests would hand the login
-page HTML to a client expecting JSON/SSE, leaving single-page apps retrying forever.
-The 401 deliberately omits `WWW-Authenticate` so browsers do not show a native
-credentials prompt for the upstream service.
+are redirected to the login page with a `next` parameter. API, XHR and EventSource
+requests receive `401 Unauthorized` with a JSON body and an `X-TOTP-Gate-Login`
+header instead. Redirecting those requests would hand the login page HTML to a
+client expecting JSON/SSE, leaving single-page apps retrying forever. The 401
+deliberately omits `WWW-Authenticate` so browsers do not show a native credentials
+prompt for the upstream service.
+
+Service worker script requests (`Sec-Fetch-Dest: serviceworker`, or `/sw.js`) are
+answered with a small worker that clears the app's caches, unregisters itself and
+reloads open windows. Apps that precache their shell serve navigations from that
+cache — sometimes for every path, including `/totp-gate/login` — so without this
+the cached app keeps hiding the login page and the user can never sign in again.
 
 ## Endpoints
 

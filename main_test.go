@@ -664,6 +664,63 @@ func TestWriteAuthRequired(t *testing.T) {
 			t.Errorf("Location = %q, want %q", got, want)
 		}
 	})
+
+	t.Run("service worker gets reset script", func(t *testing.T) {
+		// A cached shell must not be able to keep answering navigations with the
+		// app instead of the login page, so the worker is replaced while the
+		// session is invalid.
+		req := httptest.NewRequest("GET", "/sw.js", nil)
+		req.Header.Set("Sec-Fetch-Dest", "serviceworker")
+		req.Header.Set("Sec-Fetch-Mode", "no-cors")
+		rr := httptest.NewRecorder()
+		if got := writeAuthRequired(rr, req, "/sw.js"); got != http.StatusOK {
+			t.Fatalf("status = %d, want %d", got, http.StatusOK)
+		}
+		if got := rr.Code; got != http.StatusOK {
+			t.Errorf("recorder status = %d, want %d", got, http.StatusOK)
+		}
+		if got := rr.Header().Get("Location"); got != "" {
+			t.Errorf("service worker responses must not redirect, got Location %q", got)
+		}
+		if got, want := rr.Header().Get("Content-Type"), "text/javascript; charset=utf-8"; got != want {
+			t.Errorf("Content-Type = %q, want %q", got, want)
+		}
+		if got, want := rr.Header().Get("Cache-Control"), "no-store"; got != want {
+			t.Errorf("Cache-Control = %q, want %q", got, want)
+		}
+		body := rr.Body.String()
+		for _, want := range []string{"skipWaiting", "caches.delete", "unregister", "navigate"} {
+			if !strings.Contains(body, want) {
+				t.Errorf("reset worker should contain %q, got:\n%s", want, body)
+			}
+		}
+	})
+}
+
+func TestIsServiceWorkerRequest(t *testing.T) {
+	tests := []struct {
+		name    string
+		path    string
+		headers map[string]string
+		want    bool
+	}{
+		{"fetch destination", "/sw.js", map[string]string{"Sec-Fetch-Dest": "serviceworker"}, true},
+		{"path fallback", "/sw.js", nil, true},
+		{"document navigation", "/", map[string]string{"Sec-Fetch-Dest": "document"}, false},
+		{"script fetch", "/sw.js", map[string]string{"Sec-Fetch-Dest": "script"}, false},
+		{"other path", "/app.js", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", tt.path, nil)
+			for k, v := range tt.headers {
+				req.Header.Set(k, v)
+			}
+			if got := isServiceWorkerRequest(req); got != tt.want {
+				t.Errorf("isServiceWorkerRequest() = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }
 
 func TestIsStreamingRequest(t *testing.T) {

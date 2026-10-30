@@ -512,8 +512,11 @@ func logCookieRejection(r *http.Request, cfg *config, result cookieValidationRes
 
 	log.Printf("%s", msg)
 	action := "auth redirect"
-	if status == http.StatusUnauthorized {
+	switch status {
+	case http.StatusUnauthorized:
 		action = "auth required"
+	case http.StatusOK:
+		action = "service worker reset"
 	}
 	logRequest(r, status, action+": "+result.reason)
 }
@@ -559,16 +562,74 @@ func isNavigationRequest(r *http.Request) bool {
 	return strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/html")
 }
 
+// isServiceWorkerRequest reports whether the request fetches the app's service
+// worker script. Browsers fetch that script from the network even when a worker
+// is already registered, which makes it the only way to break out of a stale
+// offline shell.
+func isServiceWorkerRequest(r *http.Request) bool {
+	if dest := strings.TrimSpace(r.Header.Get("Sec-Fetch-Dest")); dest != "" {
+		return strings.EqualFold(dest, "serviceworker")
+	}
+	// Fallback for browsers that do not send Sec-Fetch-* headers; /sw.js is the
+	// conventional service worker path used by most single-page apps.
+	return strings.EqualFold(r.URL.Path, "/sw.js")
+}
+
+// serviceWorkerResetScript replaces the app's service worker while the session
+// is invalid.
+//
+// Progressive web apps precache their shell and answer navigations from that
+// cache, often for every path including /totp-gate/login. Once the session
+// expires such a worker keeps serving the cached app, so reloads never reach
+// the gate, the user never sees the login page, and the app retries its API
+// calls against 401 responses forever. Serving this script in place of the
+// worker makes the browser install a worker that clears the caches, unregisters
+// itself and reloads every open window, which lands on the login page.
+const serviceWorkerResetScript = `// Served by totp-gate because the session is invalid.
+self.addEventListener('install', function () {
+  self.skipWaiting();
+});
+self.addEventListener('activate', function (event) {
+  event.waitUntil((async function () {
+    for (const key of await caches.keys()) {
+      await caches.delete(key);
+    }
+    await self.registration.unregister();
+    const clients = await self.clients.matchAll({ type: 'window' });
+    for (const client of clients) {
+      client.navigate(client.url).catch(function () {});
+    }
+  })());
+});
+`
+
+// writeServiceWorkerReset answers a service worker script request that must not
+// be proxied to the upstream app.
+func writeServiceWorkerReset(w http.ResponseWriter) int {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write([]byte(serviceWorkerResetScript)); err != nil {
+		log.Printf("service worker reset write error: %v", err)
+	}
+	return http.StatusOK
+}
+
 // writeAuthRequired writes the response for an unauthenticated request and
 // returns the HTTP status used. Navigations are redirected to the login page so
-// the browser displays it; other requests get a 401 without WWW-Authenticate,
-// so clients can detect the expired session without a native browser
-// credentials prompt (which would stall the app's fetch calls).
+// the browser displays it; service worker script fetches get a reset worker so
+// a cached app shell cannot hide the login page; other requests get a 401
+// without WWW-Authenticate, so clients can detect the expired session without a
+// native browser credentials prompt (which would stall the app's fetch calls).
 func writeAuthRequired(w http.ResponseWriter, r *http.Request, nextURL string) int {
 	if nextURL == "" {
 		nextURL = "/"
 	}
 	loginURL := "/totp-gate/login?next=" + url.QueryEscape(nextURL)
+
+	if isServiceWorkerRequest(r) {
+		return writeServiceWorkerReset(w)
+	}
 
 	if isNavigationRequest(r) {
 		http.Redirect(w, r, loginURL, http.StatusSeeOther)
