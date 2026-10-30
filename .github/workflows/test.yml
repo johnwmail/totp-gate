@@ -54,12 +54,16 @@ jobs:
 
       - name: Test proxy to real HTTPS upstream (google.com) with Auth
         run: |
+          # Cookie Secure is disabled because this test speaks plain HTTP.
           docker run -d --name test-google \
             -e TOTPGATE_UPSTREAM=https://www.google.com \
             -e TOTPGATE_TOTP_SECRET=JBSWY3DPEHPK3PXP \
+            -e TOTPGATE_AUTH_COOKIE_SECURE=false \
             --network host \
             totp-gate:test
           sleep 3
+
+          RESOLVE_GOOGLE="--resolve www.google.com:8080:127.0.0.1"
 
           # Generate valid TOTP code
           CODE=$(python3 -c "
@@ -74,9 +78,20 @@ jobs:
           ")
           echo "Generated TOTP Code: $CODE"
 
-          # Login and save cookie
-          LOGIN_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -c /tmp/cookie.txt \
-            -X POST -d "code=$CODE" http://localhost:8080/totp-gate/login)
+          # An unauthenticated API request must get a JSON 401, not a redirect to
+          # the HTML login page (API clients follow redirects silently and then
+          # retry forever, which looks like a hang).
+          UNAUTH_STATUS=$(curl -s -o /tmp/unauth.json -w "%{http_code}" $RESOLVE_GOOGLE \
+            -H "Accept: application/json" \
+            http://www.google.com:8080/api/ping)
+          echo "Unauthenticated API status: $UNAUTH_STATUS"
+          echo "Unauthenticated API body: $(cat /tmp/unauth.json)"
+
+          # Login for the www.google.com host so the cookie host matches.
+          # Do not use -L: an authenticated request must not be redirected.
+          LOGIN_STATUS=$(curl -s -o /dev/null -w "%{http_code}" $RESOLVE_GOOGLE \
+            -c /tmp/cookie-google.txt \
+            -X POST -d "code=$CODE" http://www.google.com:8080/totp-gate/login)
           echo "Login Status: $LOGIN_STATUS"
 
           if [ "$LOGIN_STATUS" != "303" ]; then
@@ -86,13 +101,29 @@ jobs:
             exit 1
           fi
 
-          # Access upstream with cookie (follow redirects)
-          CODE=$(curl -s -o /dev/null -w "%{http_code}" -b /tmp/cookie.txt -L \
-            --resolve www.google.com:8080:127.0.0.1 \
+          # Authenticated request must reach the real upstream directly.
+          GOOGLE_STATUS=$(curl -s -o /tmp/google.html -w "%{http_code}" $RESOLVE_GOOGLE \
+            -b /tmp/cookie-google.txt \
             http://www.google.com:8080/)
-          echo "google.com response: $CODE"
+          echo "google.com response: $GOOGLE_STATUS"
 
-          if [ "$CODE" -ne 200 ]; then
+          FAILED=0
+          if [ "$UNAUTH_STATUS" != "401" ]; then
+            echo "FAIL: unauthenticated API request should return 401, got $UNAUTH_STATUS"
+            FAILED=1
+          elif ! grep -q '"error"' /tmp/unauth.json; then
+            echo "FAIL: unauthenticated API response should be JSON, got: $(cat /tmp/unauth.json)"
+            FAILED=1
+          fi
+          if [ "$GOOGLE_STATUS" != "200" ]; then
+            echo "FAIL: authenticated request should return 200, got $GOOGLE_STATUS"
+            FAILED=1
+          elif ! grep -qi "<title>Google" /tmp/google.html; then
+            echo "FAIL: response body does not look like google.com: $(head -c 200 /tmp/google.html)"
+            FAILED=1
+          fi
+
+          if [ "$FAILED" -ne 0 ]; then
             echo "Proxy failed"
             docker logs test-google
             docker rm -f test-google
@@ -103,15 +134,18 @@ jobs:
 
       - name: Test multi-target routing with real HTTPS backends and Auth
         run: |
+          # Cookie Secure is disabled because this test speaks plain HTTP.
           docker run -d --name test-multi \
-            -e TOTPGATE_TARGETS="www.google.com=https://www.google.com,github.com=https://github.com" \
+            -e TOTPGATE_TARGETS="www.google.com=https://www.google.com,www.wikipedia.org=https://www.wikipedia.org" \
             -e TOTPGATE_TOTP_SECRET=JBSWY3DPEHPK3PXP \
+            -e TOTPGATE_AUTH_COOKIE_SECURE=false \
             --network host \
             totp-gate:test
           sleep 3
 
-          # Generate valid TOTP code
-          CODE=$(python3 -c "
+          # Helper: generate a valid TOTP code
+          gen_totp() {
+            python3 -c "
           import hmac, hashlib, struct, time, base64
           def hotp(key, counter, digits=6):
               key = base64.b32decode(key.upper())
@@ -120,34 +154,64 @@ jobs:
               o = h[19] & 15
               return str((struct.unpack('>I', h[o:o+4])[0] & 0x7fffffff) % 10**digits).zfill(digits)
           print(hotp('JBSWY3DPEHPK3PXP', int(time.time()) // 30))
-          ")
-          echo "Generated TOTP Code: $CODE"
+          "
+          }
 
-          # Login and save cookie
-          LOGIN_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -c /tmp/cookie.txt \
-            -X POST -d "code=$CODE" http://localhost:8080/totp-gate/login)
-          echo "Login Status: $LOGIN_STATUS"
+          # Helper: login for a host (cookies are host-only, so one login per host)
+          do_login() {
+            local host="$1"
+            local code; code=$(gen_totp)
+            local status
+            status=$(curl -s -o /dev/null -w "%{http_code}" \
+              --resolve "$host:8080:127.0.0.1" \
+              -c "/tmp/cookie-$host.txt" \
+              -X POST -d "code=$code" \
+              "http://$host:8080/totp-gate/login")
+            echo "Login ($host): $status"
+            [ "$status" = "303" ]
+          }
 
-          if [ "$LOGIN_STATUS" != "303" ]; then
-            echo "Login failed"
+          # Helper: fetch a host through the gateway without following redirects
+          fetch_host() {
+            local host="$1"
+            curl -s -o "/tmp/body-$host.html" -w "%{http_code}" \
+              --resolve "$host:8080:127.0.0.1" \
+              -b "/tmp/cookie-$host.txt" \
+              "http://$host:8080/"
+          }
+
+          do_login www.google.com || {
+            echo "Login failed for www.google.com"
             docker logs test-multi
             docker rm -f test-multi
             exit 1
-          fi
+          }
+          do_login www.wikipedia.org || {
+            echo "Login failed for www.wikipedia.org"
+            docker logs test-multi
+            docker rm -f test-multi
+            exit 1
+          }
 
           # Route 1: www.google.com:8080 -> localhost:8080 -> https://www.google.com
-          CODE1=$(curl -s -o /dev/null -w "%{http_code}" -b /tmp/cookie.txt -L \
-            --resolve www.google.com:8080:127.0.0.1 \
-            http://www.google.com:8080/)
+          CODE1=$(fetch_host www.google.com)
           echo "www.google.com response: $CODE1"
 
-          # Route 2: github.com:8080 -> localhost:8080 -> https://github.com
-          CODE2=$(curl -s -o /dev/null -w "%{http_code}" -b /tmp/cookie.txt -L \
-            --resolve github.com:8080:127.0.0.1 \
-            http://github.com:8080/)
-          echo "github.com response: $CODE2"
+          # Route 2: www.wikipedia.org:8080 -> localhost:8080 -> https://www.wikipedia.org
+          CODE2=$(fetch_host www.wikipedia.org)
+          echo "www.wikipedia.org response: $CODE2"
 
-          if [ "$CODE1" -ne 200 ] || [ "$CODE2" -ne 200 ]; then
+          FAILED=0
+          if [ "$CODE1" != "200" ] || ! grep -qi "<title>Google" "/tmp/body-www.google.com.html"; then
+            echo "FAIL: www.google.com should reach Google, got $CODE1"
+            FAILED=1
+          fi
+          if [ "$CODE2" != "200" ] || ! grep -qi "<title>Wikipedia" "/tmp/body-www.wikipedia.org.html"; then
+            echo "FAIL: www.wikipedia.org should reach Wikipedia, got $CODE2"
+            FAILED=1
+          fi
+
+          if [ "$FAILED" -ne 0 ]; then
             echo "Proxy failed"
             docker logs test-multi
             docker rm -f test-multi
