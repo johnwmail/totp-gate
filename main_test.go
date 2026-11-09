@@ -723,6 +723,112 @@ func TestIsServiceWorkerRequest(t *testing.T) {
 	}
 }
 
+func TestLogout(t *testing.T) {
+	sessionCookie := func(t *testing.T, rr *httptest.ResponseRecorder) *http.Cookie {
+		t.Helper()
+		for _, c := range rr.Result().Cookies() {
+			if c.Name == "totpgate_session" {
+				return c
+			}
+		}
+		t.Fatalf("totpgate_session cookie missing from Set-Cookie: %v", rr.Header().Values("Set-Cookie"))
+		return nil
+	}
+
+	t.Run("navigation clears cookie and resets client state", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/totp-gate/logout", nil)
+		req.Header.Set("Sec-Fetch-Mode", "navigate")
+		rr := httptest.NewRecorder()
+
+		handleLogout(&config{}).ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", rr.Code, http.StatusOK)
+		}
+		c := sessionCookie(t, rr)
+		if c.Value != "" || c.MaxAge >= 0 {
+			t.Errorf("session cookie not expired: value=%q max-age=%d", c.Value, c.MaxAge)
+		}
+		if got, want := rr.Header().Get("Clear-Site-Data"), `"cache", "storage"`; got != want {
+			t.Errorf("Clear-Site-Data = %q, want %q", got, want)
+		}
+		if got, want := rr.Header().Get("Cache-Control"), "no-store"; got != want {
+			t.Errorf("Cache-Control = %q, want %q", got, want)
+		}
+		body := rr.Body.String()
+		for _, want := range []string{
+			"/totp-gate/login",
+			"serviceWorker",
+			"unregister",
+			"caches.delete",
+			"localStorage.clear",
+			"sessionStorage.clear",
+			"location.replace",
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("logout page should contain %q, got:\n%s", want, body)
+			}
+		}
+	})
+
+	t.Run("keeps next destination", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/totp-gate/logout?next=%2Fsession%2Fabc%3Ftab%3D1", nil)
+		req.Header.Set("Sec-Fetch-Mode", "navigate")
+		rr := httptest.NewRecorder()
+
+		handleLogout(&config{}).ServeHTTP(rr, req)
+
+		if body := rr.Body.String(); !strings.Contains(body, "/totp-gate/login?next=%2Fsession%2Fabc%3Ftab%3D1") {
+			t.Errorf("logout page should preserve next, got:\n%s", body)
+		}
+	})
+
+	t.Run("api logout clears cookie without a page", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/totp-gate/logout", nil)
+		req.Header.Set("Sec-Fetch-Mode", "cors")
+		rr := httptest.NewRecorder()
+
+		handleLogout(&config{}).ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusNoContent {
+			t.Fatalf("status = %d, want %d", rr.Code, http.StatusNoContent)
+		}
+		if body := rr.Body.String(); body != "" {
+			t.Errorf("expected empty body, got %q", body)
+		}
+		sessionCookie(t, rr)
+	})
+
+	t.Run("secure cookie flags are preserved when clearing", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/totp-gate/logout", nil)
+		req.Header.Set("Sec-Fetch-Mode", "cors")
+		rr := httptest.NewRecorder()
+
+		handleLogout(&config{cookieSecure: true}).ServeHTTP(rr, req)
+
+		if c := sessionCookie(t, rr); !c.Secure || !c.HttpOnly {
+			t.Errorf("cleared cookie should keep Secure and HttpOnly flags, got %+v", c)
+		}
+	})
+
+	t.Run("rejects unsupported methods", func(t *testing.T) {
+		req := httptest.NewRequest("DELETE", "/totp-gate/logout", nil)
+		rr := httptest.NewRecorder()
+
+		handleLogout(&config{}).ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("status = %d, want %d", rr.Code, http.StatusMethodNotAllowed)
+		}
+		if got := rr.Header().Get("Allow"); got != "GET, POST" {
+			t.Errorf("Allow = %q, want %q", got, "GET, POST")
+		}
+		if got := len(rr.Result().Cookies()); got != 0 {
+			t.Errorf("rejected method must not clear cookies, got %d Set-Cookie headers", got)
+		}
+	})
+}
+
 func TestIsStreamingRequest(t *testing.T) {
 	tests := []struct {
 		name    string

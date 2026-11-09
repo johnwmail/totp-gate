@@ -647,6 +647,139 @@ func writeAuthRequired(w http.ResponseWriter, r *http.Request, nextURL string) i
 	return http.StatusUnauthorized
 }
 
+// clearCookie expires the session cookie. The attributes must match setCookie
+// so browsers replace (rather than duplicate) the existing cookie.
+func clearCookie(w http.ResponseWriter, secure bool) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "totpgate_session",
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		Expires:  time.Unix(1, 0),
+		HttpOnly: true,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+// logoutPageHTML is served by /totp-gate/logout. Deleting the gate cookie is
+// not enough on its own: a PWA keeps its old app shell in the service worker
+// cache, so the browser can keep showing the cached app (and its skeleton UI)
+// instead of the login page. The page therefore unregisters the app's workers
+// and clears Cache Storage / Web Storage before redirecting to the login page.
+const logoutPageHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="3;url={{.Next}}">
+<title>Signing out…</title>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: #0e1621;
+    color: #e6edf3;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    margin: 0;
+  }
+  .card {
+    background: #16202b;
+    border: 1px solid #253243;
+    border-radius: 12px;
+    padding: 2rem;
+    max-width: 380px;
+    text-align: center;
+  }
+  h1 { font-size: 1.25rem; margin: 0 0 0.75rem; }
+  p { color: #9fb0c3; font-size: 0.9rem; line-height: 1.5; }
+  a { color: #00b4d8; }
+</style>
+</head>
+<body>
+<main class="card">
+  <h1>Signing out…</h1>
+  <p>Clearing the local session, service worker and cached app files.</p>
+  <p><a href="{{.Next}}">Continue to login</a></p>
+</main>
+<script>
+(async function () {
+  try {
+    if ('serviceWorker' in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map(function (reg) { return reg.unregister(); }));
+    }
+  } catch (e) {}
+  try {
+    if (window.caches && caches.keys) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map(function (key) { return caches.delete(key); }));
+    }
+  } catch (e) {}
+  try { localStorage.clear(); } catch (e) {}
+  try { sessionStorage.clear(); } catch (e) {}
+  location.replace({{.Next}});
+})();
+</script>
+</body>
+</html>`
+
+var logoutPageTemplate = template.Must(template.New("logout-page").Parse(logoutPageHTML))
+
+func renderLogoutPage(loginURL string) []byte {
+	var buf bytes.Buffer
+	if err := logoutPageTemplate.Execute(&buf, struct{ Next string }{Next: loginURL}); err != nil {
+		log.Printf("logout page render error: %v", err)
+		return []byte("internal server error")
+	}
+	return buf.Bytes()
+}
+
+// handleLogout clears the gate session and any client-side state that can keep
+// a stale app shell alive. It deliberately does not require a valid session:
+// logging out an already-expired session is harmless and makes the endpoint a
+// reliable escape hatch when a cached app is stuck.
+func handleLogout(cfg *config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodPost {
+			w.Header().Set("Allow", "GET, POST")
+			logRequest(r, http.StatusMethodNotAllowed, "logout method not allowed")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		clearCookie(w, cfg.cookieSecure)
+
+		loginURL := "/totp-gate/login"
+		if nextURL := sanitizeNextURL(r.URL.Query().Get("next")); nextURL != "" {
+			loginURL += "?next=" + url.QueryEscape(nextURL)
+		}
+
+		log.Printf("logout from IP %s: session cleared", clientIP(r, cfg.trustedProxies))
+
+		if isNavigationRequest(r) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-store")
+			// Best effort on top of the script below; browsers only honour
+			// Clear-Site-Data in a secure context, so the page must still do
+			// the cleanup itself.
+			w.Header().Set("Clear-Site-Data", `"cache", "storage"`)
+			w.WriteHeader(http.StatusOK)
+			if _, err := w.Write(renderLogoutPage(loginURL)); err != nil {
+				log.Printf("logout page write error: %v", err)
+			}
+			logRequest(r, http.StatusOK, "logout page served")
+			return
+		}
+
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusNoContent)
+		logRequest(r, http.StatusNoContent, "logout; session cookie cleared")
+	}
+}
+
 // setCookie creates a session cookie with expiry and timestamps.
 // Format: <loginTime_hex>.<lastActivity_hex>.<signature_hex>
 func setCookie(w http.ResponseWriter, cookieKey []byte, maxAge int, loginTime int64, lastActivity int64, secure bool) {
@@ -1621,6 +1754,8 @@ func main() {
 
 	// Login page handlers
 	mux.HandleFunc("/totp-gate/login", func(w http.ResponseWriter, r *http.Request) {
+		// Never let a stale login page (or a cached redirect) be replayed.
+		w.Header().Set("Cache-Control", "no-store")
 		nextURL := sanitizeNextURL(r.URL.Query().Get("next"))
 		displayURL := accessURL(r, nextURL, cfg.trustedProxies)
 		ip := clientIP(r, cfg.trustedProxies)
@@ -1684,6 +1819,10 @@ func main() {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
+
+	// Logout: clear the gate cookie and the client-side caches that can keep a
+	// stale app shell (skeleton UI) on screen after the session ends.
+	mux.HandleFunc("/totp-gate/logout", handleLogout(cfg))
 
 	// All other requests: auth check then proxy
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

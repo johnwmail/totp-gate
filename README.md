@@ -218,12 +218,27 @@ reloads open windows. Apps that precache their shell serve navigations from that
 cache — sometimes for every path, including `/totp-gate/login` — so without this
 the cached app keeps hiding the login page and the user can never sign in again.
 
+### Logout and client reset
+
+Open `/totp-gate/logout` to end the session. Besides expiring the
+`totpgate_session` cookie it also clears the client-side state that a stale
+single-page app can hide behind: registered service workers, Cache Storage,
+`localStorage` and `sessionStorage`. The page then redirects to the login page,
+optionally preserving `?next=/path`.
+
+This is useful when the upstream app is stuck on its loading skeleton while the
+gate session is still technically valid (for example after upgrading the app
+image): restarting the container does not clear the browser's cached shell, but
+a logout does. The endpoint accepts `GET` and `POST`, does not require a valid
+session, and returns `204 No Content` for non-navigation clients.
+
 ## Endpoints
 
 | Path | Description |
 |------|-------------|
 | `/health` | Health check, returns `OK` |
 | `/totp-gate/login` | TOTP login page (GET) and submission (POST) |
+| `/totp-gate/logout` | Clear the session and client-side caches, then return to login |
 | `/` | Authenticated reverse proxy |
 
 ## Rate Limiting
