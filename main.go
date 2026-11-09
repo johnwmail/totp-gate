@@ -1823,6 +1823,13 @@ func main() {
 	// Logout: clear the gate cookie and the client-side caches that can keep a
 	// stale app shell (skeleton UI) on screen after the session ends.
 	mux.HandleFunc("/totp-gate/logout", handleLogout(cfg))
+	// The app's generated service worker answers navigations from its precached
+	// shell for every path outside its denylist (opencode denies only /api,
+	// /auth and the asset directories). A navigation to /totp-gate/logout is
+	// therefore served by the worker and never reaches this gate, so logout
+	// appears to do nothing. Expose the same handler under /auth, which the
+	// worker passes to the network.
+	mux.HandleFunc("/auth/totp-gate/logout", handleLogout(cfg))
 
 	// All other requests: auth check then proxy
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

@@ -220,11 +220,19 @@ the cached app keeps hiding the login page and the user can never sign in again.
 
 ### Logout and client reset
 
-Open `/totp-gate/logout` to end the session. Besides expiring the
+Open `/auth/totp-gate/logout` to end the session. Besides expiring the
 `totpgate_session` cookie it also clears the client-side state that a stale
 single-page app can hide behind: registered service workers, Cache Storage,
 `localStorage` and `sessionStorage`. The page then redirects to the login page,
 optionally preserving `?next=/path`.
+
+Use the `/auth/` path, not `/totp-gate/logout`: apps whose service worker
+precaches its shell answer navigations from that cache for every path outside
+their navigation denylist, which usually contains only `/api` and `/auth`. A
+navigation to `/totp-gate/logout` is then handled by the worker and never
+reaches this gate, so the logout page appears not to load at all.
+`/totp-gate/logout` remains registered for clients that reach the network
+directly (no service worker, or a hard reload).
 
 This is useful when the upstream app is stuck on its loading skeleton while the
 gate session is still technically valid (for example after upgrading the app
@@ -238,7 +246,8 @@ session, and returns `204 No Content` for non-navigation clients.
 |------|-------------|
 | `/health` | Health check, returns `OK` |
 | `/totp-gate/login` | TOTP login page (GET) and submission (POST) |
-| `/totp-gate/logout` | Clear the session and client-side caches, then return to login |
+| `/auth/totp-gate/logout` | Clear the session and client-side caches, then return to login (service-worker safe) |
+| `/totp-gate/logout` | Same handler, for clients that reach the network directly |
 | `/` | Authenticated reverse proxy |
 
 ## Rate Limiting
